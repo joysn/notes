@@ -509,6 +509,118 @@ Note: The runner is already **registered** on GitHub at this point (status: "off
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Order of Operations: JIT Token FIRST, Then Pod Creation
+
+The JIT config token is obtained **before** the pod is created. This is required because the token is baked into the pod spec itself (as args/env). The pod cannot exist without it.
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────────────────────
+
+  ④ EphemeralRunner     ⑤ Controller calls     ⑥ GitHub returns       ⑦ Controller
+     CR created            GitHub API:            response:              creates Pod
+     (name known:          generate-jitconfig     {                      with JIT config
+      "arc-runner-                                  runner: {             in args/env
+       set-abc123")        { name: "...",             id: 42,
+                             runner_group_id: 1,      status: "offline",
+                             labels: [...] }          ephemeral: true
+                                                    },
+                                                    encoded_jit_config:
+                                                      "eyJhbG..."
+                                                  }
+         │                      │                       │                    │
+─────────┼──────────────────────┼───────────────────────┼────────────────────┼─────
+         │                      │                       │                    │
+         ▼                      ▼                       ▼                    ▼
+   Runner name is         GitHub pre-registers     Runner exists on      Pod is created
+   decided by K8s         the runner (offline)     GitHub BEFORE the     AFTER we have
+   (from CR name)                                  pod even exists       the token
+```
+
+**Why this order?**
+- The `generate-jitconfig` API both **registers the runner** AND returns the token in one call
+- GitHub needs to know the runner name/labels/group upfront to allocate an ID
+- The pod spec needs the token at creation time — you can't inject it after the fact
+- If the pod later fails to start, the controller's finalizer deregisters the orphaned "offline" runner from GitHub
+
+### Why JIT Token Exists — The Security Problem It Solves
+
+The JIT token solves a **credential scoping problem**. Without it, you'd have to put your org-level PAT or GitHub App private key directly on the runner pod.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  WITHOUT JIT (traditional / naive approach)                              │
+│                                                                          │
+│  Controller has: PAT (admin:org scope)                                   │
+│                     │                                                    │
+│                     │  "Here, pod, use this to register yourself"         │
+│                     ▼                                                    │
+│  ┌──────────────────────────────────────┐                                │
+│  │ Runner Pod                           │                                │
+│  │                                      │                                │
+│  │  Has: PAT (admin:org scope) 😱       │                                │
+│  │                                      │                                │
+│  │  If compromised, attacker can:       │                                │
+│  │   • Register unlimited new runners   │                                │
+│  │   • List all runners in the org      │                                │
+│  │   • Delete other runners             │                                │
+│  │   • Access org-level settings        │                                │
+│  │   • Potentially pivot to other repos │                                │
+│  └──────────────────────────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  WITH JIT                                                                │
+│                                                                          │
+│  Controller has: PAT (admin:org scope) — never leaves the controller     │
+│                     │                                                    │
+│                     │  Calls GitHub API: "pre-register runner X"          │
+│                     │  Gets back: single-use JIT token (scoped to X)     │
+│                     │                                                    │
+│                     │  "Here, pod, use this to CONNECT as runner X"       │
+│                     ▼                                                    │
+│  ┌──────────────────────────────────────┐                                │
+│  │ Runner Pod                           │                                │
+│  │                                      │                                │
+│  │  Has: JIT token (scoped, single-use) │                                │
+│  │                                      │                                │
+│  │  If compromised, attacker can:       │                                │
+│  │   • Connect as THIS runner only      │                                │
+│  │   • ...that's it                     │                                │
+│  │                                      │                                │
+│  │  Attacker CANNOT:                    │                                │
+│  │   • Register new runners             │                                │
+│  │   • See other runners                │                                │
+│  │   • Access org settings              │                                │
+│  │   • Reuse the token (it's one-shot)  │                                │
+│  └──────────────────────────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Hotel analogy:**
+
+| Concept | Hotel analogy |
+|---------|--------------|
+| PAT / GitHub App key | Master key card (opens every room) |
+| JIT token | Room-specific key card (opens only room 42, expires at checkout) |
+| Controller | Front desk (holds master, issues room keys) |
+| Runner Pod | Hotel guest (only gets their room key) |
+
+**Three design goals JIT achieves:**
+
+1. **Least privilege** — the pod only gets credentials to do one thing: connect as one pre-registered runner
+2. **No config step** — traditional `config.sh` creates a `.credentials` file with long-lived RSA keys; JIT skips all of that
+3. **Ephemeral by design** — token is meaningless after the pod connects; there's nothing to steal that's reusable
+
+**What would happen without JIT?**
+
+- **Put the PAT on every pod** → massive blast radius if any pod is compromised (supply-chain attack in a workflow step, malicious action, etc.)
+- **Use a registration token** → better, but it's reusable for 1 hour and anyone who intercepts it can register arbitrary runners into your org
+- **Mount a shared secret** → same problem, plus secret rotation becomes a nightmare at scale
+
+JIT eliminates all of these by making the controller the **single trust boundary** — the only component that ever touches your org credentials.
+
 ### Traditional Registration vs. JIT Registration
 
 | Aspect | Traditional (config.sh) | JIT (ARC) |
@@ -519,6 +631,98 @@ Note: The runner is already **registered** on GitHub at this point (status: "off
 | Runner identity | Created during config.sh | Pre-created by Controller via API |
 | Reuse | Runner persists across jobs | One job, then destroyed |
 | Compromise blast radius | Can re-register, has long-lived creds | Token is single-use, scoped |
+
+### Why Is a Credential (JIT or Traditional) Required At All?
+
+The credential is NOT just for the initial "registration" step. It's the runner's **authenticated identity for EVERY API call throughout its entire lifetime**:
+
+```
+Runner Pod lifecycle — EVERY arrow is an authenticated HTTPS call:
+
+    ┌────────────────────────────────────────────────────────────┐
+    │  "Who are you? Prove it." ← GitHub asks this EVERY TIME    │
+    └────────────────────────────────────────────────────────────┘
+
+    Runner Pod                                     GitHub
+        │                                            │
+        │── "I'm runner 42" (credential) ───────────▶│ Connect & get job
+        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 1
+        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 2
+        │── "I'm runner 42" (credential) ───────────▶│ Mark step 1 done ✓
+        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 3
+        │── "I'm runner 42" (credential) ───────────▶│ Upload artifact
+        │── "I'm runner 42" (credential) ───────────▶│ Mark step 2 done ✓
+        │── "I'm runner 42" (credential) ───────────▶│ Save cache
+        │── "I'm runner 42" (credential) ───────────▶│ Report job complete
+        │── "I'm runner 42" (credential) ───────────▶│ Deregister myself
+```
+
+**What the credential provides:**
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  1. IDENTITY    — Proves to GitHub "I am runner 42, not an        │
+│                   imposter"                                        │
+│                                                                    │
+│  2. AUTHORIZATION — GitHub checks "is runner 42 allowed to        │
+│                     receive job 789?" (was it assigned to this     │
+│                     scale set?)                                    │
+│                                                                    │
+│  3. SESSION     — Every subsequent API call (logs, status,        │
+│                   artifacts, completion) uses this as bearer token │
+│                                                                    │
+│  4. INTEGRITY   — GitHub can trust that logs/results came from    │
+│                   the real runner, not a man-in-the-middle         │
+└────────────────────────────────────────────────────────────────────┘
+
+Think of it as: an API key for the runner's ENTIRE conversation
+with GitHub, from "hello" to "goodbye"
+```
+
+**What happens without any credential?**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  WITHOUT any credential on the pod:                           │
+│                                                               │
+│  • Pod can't open long-poll connection                        │
+│    (GitHub: "who are you? rejected.")                         │
+│                                                               │
+│  • Pod runs the job... but can't send logs to GitHub          │
+│    (GitHub: "who are you? rejected.")                         │
+│                                                               │
+│  • Pod finishes... but can't report success/failure           │
+│    (GitHub: "who are you? rejected.")                         │
+│                                                               │
+│  • Pod wants to upload artifacts... rejected.                 │
+│                                                               │
+│  • Job hangs forever as "In Progress" on GitHub UI            │
+│    because nobody authenticated is telling GitHub it's done   │
+│                                                               │
+│  Also:                                                        │
+│  • Any random machine could POST fake logs to GitHub          │
+│  • Anyone could claim "job succeeded" for your workflow       │
+│  • No way to verify that results came from YOUR runner        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Why registration is needed (separate from the credential):**
+
+1. GitHub needs to **know the runner exists** before assigning it a job
+2. GitHub needs to **issue a scoped credential** so the runner can make authenticated calls
+3. GitHub needs to **track which runner is doing what** (UI, billing, audit logs)
+
+Without registration, GitHub has no way to distinguish your legitimate runner from a random machine on the internet claiming to be one.
+
+**Analogy — phone call with your bank:**
+
+| Step | Without auth | With auth |
+|------|-------------|-----------|
+| "Transfer $500" | Bank: "Who is this? No." | Bank: "Verified. Done." |
+| "What's my balance?" | Bank: "Prove who you are" | Bank: "$1200" |
+| "Close my account" | Bank: "Absolutely not" | Bank: "Confirmed" |
+
+The credential isn't just for "calling the bank" (connecting). It's needed for **every action during the call** (the entire session).
 
 ### Failure Handling During Registration
 
@@ -569,6 +773,178 @@ Key failure behaviors:
 - **Runner never connects**: GitHub times out after 24 hours, unassigns the job
 - **Listener pod evicted**: Controller restarts it automatically
 - **Long-poll session expires**: Listener refreshes the session token
+
+---
+
+## How GitHub Communicates with Pods (It Doesn't — Pods Call Out)
+
+### The Key Insight
+
+GitHub **never initiates** a connection to your pods. All communication is **outbound from your infrastructure**. The pod opens an HTTPS connection to GitHub and holds it open — GitHub responds on that same connection when there's something to say.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│   COMMON MISCONCEPTION:                                                  │
+│                                                                          │
+│   GitHub ──────── pushes jobs to ──────────▶ Runner Pod     ✗ WRONG      │
+│                                                                          │
+│                                                                          │
+│   REALITY:                                                               │
+│                                                                          │
+│   Runner Pod ──── opens HTTPS connection ──▶ GitHub                      │
+│              ◀─── GitHub responds on the ─── (same connection)           │
+│                   ALREADY-OPEN connection                ✓ CORRECT       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why? Pods Are Behind NAT/Firewalls
+
+```
+┌──────────────────────────────────────┐       ┌─────────────────────┐
+│  YOUR K8s CLUSTER                    │       │  GITHUB             │
+│                                      │       │                     │
+│  ┌────────────┐                      │       │  actions.github.com │
+│  │ Runner Pod │                      │       │                     │
+│  │ 10.0.5.23  │ ← private IP        │       │  Public IP          │
+│  └─────┬──────┘   (not routable     │       │                     │
+│        │            from internet)   │       │                     │
+│  ┌─────▼──────┐                      │       │                     │
+│  │ K8s Service│                      │       │                     │
+│  │ / NAT      │                      │       │                     │
+│  └─────┬──────┘                      │       │                     │
+│  ┌─────▼──────┐                      │       │                     │
+│  │ Firewall   │  Only OUTBOUND 443 ──┼──────▶│                     │
+│  │            │  allowed             │       │                     │
+│  └────────────┘                      │       │                     │
+│                                      │       │  GitHub has NO way  │
+│  No inbound ports open!              │       │  to initiate a      │
+│  GitHub can't reach 10.0.5.23        │       │  connection to you  │
+└──────────────────────────────────────┘       └─────────────────────┘
+```
+
+### The Mechanism: HTTPS Long-Polling
+
+```
+Runner Pod                                          GitHub Actions Service
+    │                                                        │
+    │  ① HTTPS GET /messages                                 │
+    │     "Hey GitHub, got anything for me?"                  │
+    │────────────────────────────────────────────────────────▶│
+    │                                                        │
+    │         ② GitHub holds the connection OPEN              │
+    │            (doesn't respond yet)                        │
+    │            ...                                          │
+    │            ... seconds pass ...                         │
+    │            ... maybe 30-60 seconds ...                  │
+    │                                                        │
+    │                                                        │  ← job arrives
+    │                                                        │
+    │  ③ GitHub responds ON THE SAME CONNECTION              │
+    │     {jobId: 123, payload: ...}                          │
+    │◀────────────────────────────────────────────────────────│
+    │                                                        │
+    │  ④ Runner processes job                                │
+    │                                                        │
+    │  ⑤ HTTPS POST /logs, /timeline, /complete              │
+    │     (normal request-response for each)                  │
+    │────────────────────────────────────────────────────────▶│
+    │                                                        │
+    │  ⑥ Back to step ①: open a NEW long-poll               │
+    │     (or connection times out → reconnect)              │
+    │────────────────────────────────────────────────────────▶│
+    │                                                        │
+```
+
+### What is Long-Polling vs. Naive Polling?
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  POLLING (naive, wasteful)                                       │
+│                                                                  │
+│  Client: "Any jobs?" → Server: "No"     (every 5 seconds)       │
+│  Client: "Any jobs?" → Server: "No"                             │
+│  Client: "Any jobs?" → Server: "No"                             │
+│  Client: "Any jobs?" → Server: "No"                             │
+│  Client: "Any jobs?" → Server: "Yes! Here's the job"            │
+│                                                                  │
+│  Problem: thousands of runners × every 5 seconds = API rate     │
+│           limits destroyed, massive GitHub server load            │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  LONG-POLLING (what ARC uses)                                    │
+│                                                                  │
+│  Client: "Any jobs?" → Server: ...holds connection open...       │
+│                                  ...waits...                     │
+│                                  ...job arrives...               │
+│                         Server: "Yes! Here's the job"            │
+│                                                                  │
+│  ONE request, ONE response. No wasted round trips.               │
+│  Near-instant delivery (as fast as a push).                      │
+│  No API rate limit issues.                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### All Connections Are Outbound from Your Infra
+
+```
+YOUR K8s                                         GITHUB (public internet)
+────────                                         ────────────────────────
+
+Listener Pod ────── long-poll (HTTPS 443) ──────▶ Actions Service
+                    "waiting for job assignments"    (message broker)
+
+Runner Pod ──────── long-poll (HTTPS 443) ──────▶ Actions Service
+                    "waiting for my job payload"
+
+Runner Pod ──────── POST (HTTPS 443) ───────────▶ Actions Service
+                    "here are my logs"
+
+Runner Pod ──────── POST (HTTPS 443) ───────────▶ Actions Service
+                    "step 3 completed"
+
+Runner Pod ──────── PUT (HTTPS 443) ────────────▶ Artifact Service
+                    "uploading build artifacts"
+
+Runner Pod ──────── DELETE (HTTPS 443) ─────────▶ Registration Service
+                    "I'm done, deregister me"
+
+
+ALL arrows point →  (outbound from your infra)
+ZERO arrows point ← (nothing inbound)
+```
+
+### Why This Design?
+
+| Reason | Explanation |
+|--------|-------------|
+| **Firewall-friendly** | Only need outbound HTTPS (443). No inbound ports, no public IPs for runners |
+| **NAT-friendly** | Pods have private IPs (10.x, 172.x). GitHub couldn't reach them even if it wanted to |
+| **No webhook infra needed** | Webhooks require a public endpoint + TLS cert + ingress. Long-poll needs nothing |
+| **No rate limiting** | One long-lived connection vs. thousands of polling requests per minute |
+| **Scales to zero** | When no pods exist, no connections exist. GitHub just holds jobs in queue |
+| **Works behind corporate proxies** | Just a normal HTTPS request from the proxy's perspective |
+
+### Compare: Webhooks vs. Long-Poll
+
+```
+┌─────────────────────────────────────────┐  ┌────────────────────────────────────────┐
+│  WEBHOOK MODEL (NOT what ARC uses)      │  │  LONG-POLL MODEL (what ARC uses)       │
+│                                         │  │                                        │
+│  GitHub ──POST──▶ your-public-endpoint  │  │  Your pod ──GET──▶ GitHub              │
+│                                         │  │           ◀─response── (when ready)    │
+│  Requires:                              │  │                                        │
+│   • Public DNS name                     │  │  Requires:                             │
+│   • Ingress controller                  │  │   • Outbound HTTPS only                │
+│   • TLS certificate                     │  │   • Nothing else                       │
+│   • Open firewall port                  │  │                                        │
+│   • DDoS protection                     │  │                                        │
+└─────────────────────────────────────────┘  └────────────────────────────────────────┘
+```
+
+This is why ARC works in any environment — air-gapped networks (with a proxy), private clusters, behind NATs — as long as you have outbound HTTPS to `github.com` / `*.actions.githubusercontent.com`.
 
 ---
 

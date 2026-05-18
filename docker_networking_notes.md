@@ -59,10 +59,10 @@ Every container joins the **bridge** network by default. Docker creates a virtua
 ┌─────────────────────────────────────────────────────────┐
 │  HOST MACHINE                                           │
 │                                                         │
-│  ┌───────────┐    ┌───────────┐                         │
-│  │Container A│    │Container B│                         │
-│  │172.17.0.2 │    │172.17.0.3 │                         │
-│  └─────┬─────┘    └─────┬─────┘                         │
+│  ┌───────────┐    ┌───────────┐                        │
+│  │Container A│    │Container B│                        │
+│  │172.17.0.2 │    │172.17.0.3 │                        │
+│  └─────┬─────┘    └─────┬─────┘                        │
 │        │  veth          │  veth                         │
 │        └───────┬────────┘                               │
 │                │                                        │
@@ -117,10 +117,10 @@ Usable hosts = 2^(32 - prefix) - 2
 ┌──────────────────────────────────────────┐
 │  Default Bridge Network (172.17.0.0/16)  │
 │                                          │
-│  ┌─────────────┐    ┌─────────────┐      │
-│  │ Container A │◄──►│ Container B │      │
-│  │ 172.17.0.2  │    │ 172.17.0.3  │      │
-│  └─────────────┘    └─────────────┘      │
+│  ┌─────────────┐    ┌─────────────┐     │
+│  │ Container A │◄──►│ Container B │     │
+│  │ 172.17.0.2  │    │ 172.17.0.3  │     │
+│  └─────────────┘    └─────────────┘     │
 │         ping ✓ (must use IP addresses)   │
 └──────────────────────────────────────────┘
 ```
@@ -138,7 +138,7 @@ $ docker network create network-b
 │  172.18.0.0/16      │     │  172.19.0.0/16      │
 │                     │     │                     │
 │  ┌─────────────┐    │     │  ┌─────────────┐    │
-│  │ Container A │────X─────── │ Container B │    │
+│  │ Container A │────X──────── │ Container B │    │
 │  │ 172.18.0.2  │    │     │  │ 172.19.0.2  │    │
 │  └─────────────┘    │     │  └─────────────┘    │
 └─────────────────────┘     └─────────────────────┘
@@ -191,20 +191,20 @@ docker network connect network-b container # Add container to network
 ┌─────────────────────────────────────────────────────────────────┐
 │  DOCKER HOST                                                    │
 │                                                                 │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐   │
-│  │ Default Bridge  │  │   Network A     │  │   Network B    │   │
-│  │ 172.17.0.0/16   │  │ 172.18.0.0/16   │  │ 172.19.0.0/16  │   │
-│  │  [C1] [C2] [C3] │  │  [C4] [C5]      │  │  [C6]          │   │
-│  └────────┬────────┘  └────────┬────────┘  └───────┬────────┘   │
-│           │                    │                   │            │
-│           └────────────────────┼───────────────────┘            │
-│                                │                                │
-│                         ┌──────┴──────┐                         │
-│                         │  iptables   │                         │
-│                         └──────┬──────┘                         │
-│                         ┌──────┴──────┐                         │
-│                         │  Host NIC   │                         │
-│                         └──────┬──────┘                         │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐  │
+│  │ Default Bridge  │  │   Network A     │  │   Network B    │  │
+│  │ 172.17.0.0/16   │  │ 172.18.0.0/16   │  │ 172.19.0.0/16  │  │
+│  │  [C1] [C2] [C3] │  │  [C4] [C5]      │  │  [C6]          │  │
+│  └────────┬────────┘  └────────┬────────┘  └───────┬────────┘  │
+│           │                    │                    │            │
+│           └────────────────────┼────────────────────┘            │
+│                                │                                 │
+│                         ┌──────┴──────┐                          │
+│                         │  iptables   │                          │
+│                         └──────┬──────┘                          │
+│                         ┌──────┴──────┐                          │
+│                         │  Host NIC   │                          │
+│                         └──────┬──────┘                          │
 └────────────────────────────────┼────────────────────────────────┘
                             Internet
 ```
@@ -397,7 +397,210 @@ Docker Desktop uses VPNKit (Mac) or SSH tunnels (Lima) to proxy connections from
 
 You can only map to ports that are **free** on your host. If another process is already listening on 8080, `--publish 8080:80` will fail at container start.
 
-### Summary: Ways Containers Can Communicate
+---
+
+## Host Mode Networking (`--net=host`)
+
+### What Is It?
+
+Host mode removes **all network isolation** between the container and the host. The container shares the host's network stack directly — no bridge, no veth pairs, no NAT.
+
+### Bridge Mode vs. Host Mode
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  BRIDGE MODE (default)                                                   │
+│                                                                          │
+│  ┌───────────────────┐                                                  │
+│  │ Container         │                                                  │
+│  │ Namespace: own    │                                                  │
+│  │ IP: 172.17.0.2    │ ← virtual IP, isolated                           │
+│  │ eth0: veth pair   │ ← virtual NIC                                    │
+│  └─────────┬─────────┘                                                  │
+│            │ veth                                                        │
+│  ┌─────────▼─────────┐                                                  │
+│  │ docker0 bridge    │ ← virtual switch                                 │
+│  └─────────┬─────────┘                                                  │
+│            │ iptables (NAT)                                              │
+│  ┌─────────▼─────────┐                                                  │
+│  │ Host eth0         │ ← real NIC                                       │
+│  │ IP: 192.168.1.100 │                                                  │
+│  └───────────────────┘                                                  │
+│                                                                          │
+│  Layers: Container → veth → bridge → iptables → host NIC                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  HOST MODE (--net=host)                                                  │
+│                                                                          │
+│  ┌───────────────────┐                                                  │
+│  │ Container         │                                                  │
+│  │ Namespace: HOST's │ ← shares host's network namespace                │
+│  │ IP: 192.168.1.100 │ ← same IP as host                                │
+│  │ eth0: HOST's eth0 │ ← same real NIC as host                          │
+│  └───────────────────┘                                                  │
+│                                                                          │
+│  No bridge. No veth. No NAT. No virtual anything.                        │
+│  Container IS the host, network-wise.                                    │
+│                                                                          │
+│  Layers: Container → host NIC (direct)                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Shared vs. What Stays Isolated
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  SHARED (same as host):           STILL ISOLATED:        │
+│                                                          │
+│  ✓ Network namespace              ✗ Filesystem (own /)   │
+│  ✓ IP address(es)                 ✗ PID namespace        │
+│  ✓ All network interfaces         ✗ Mount namespace      │
+│  ✓ Port space (0-65535)           ✗ User namespace       │
+│  ✓ Routing table                                         │
+│  ✓ iptables rules (visible)                              │
+│  ✓ /etc/hosts, /etc/resolv.conf                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Why Host Mode? (Advantages)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. NO PORT PUBLISHING NEEDED                                    │
+│                                                                  │
+│     Bridge:  docker run --publish 8080:80 --publish 8081:81 ...  │
+│     Host:    docker run --net=host ...   (all ports exposed)     │
+│                                                                  │
+│     --publish is IGNORED in host mode (nothing to map)           │
+│                                                                  │
+│  2. SLIGHTLY FASTER (no overhead)                                │
+│                                                                  │
+│     Bridge: packet → veth → bridge → iptables → host NIC         │
+│     Host:   packet → host NIC                                    │
+│                                                                  │
+│     No virtual ethernet, no NAT translation, no bridge hop       │
+│                                                                  │
+│  3. REAL IP ADDRESS (no NAT)                                     │
+│                                                                  │
+│     Bridge: container sees 172.17.0.2 (virtual, behind NAT)      │
+│     Host:   container sees 192.168.1.100 (real host IP)          │
+│                                                                  │
+│     Critical for NAT-sensitive apps like VPN software            │
+│                                                                  │
+│  4. BIND TO MANY PORTS EASILY                                    │
+│                                                                  │
+│     No need to declare every port upfront with --publish         │
+│     App can dynamically bind to any free port                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Trade-offs
+
+| | Bridge mode | Host mode |
+|---|---|---|
+| Network isolation | Full (own namespace) | None (shares host's) |
+| Port conflicts | Container ports are private | Container competes with host processes for ports |
+| Security | Contained | Container can sniff host traffic, bind to any port |
+| Port publishing | Required (`--publish`) | Not needed (ignored) |
+| Performance | Slight overhead (NAT, veth) | Native speed |
+| Predictable IPs | Virtual IPs assigned by Docker | Uses host's real IPs |
+| Multiple containers same port | Fine (each has own namespace) | Conflict (only one can bind :8080) |
+
+### Example: Running a Server in Host Mode
+
+```bash
+# Run container with host networking + interactive mode
+docker run --rm -i --net=host --entrypoint nc curlimages/curl -l -p 8080
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  HOST MACHINE (192.168.1.100)                                    │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │  Container (--net=host)                               │       │
+│  │                                                       │       │
+│  │  nc -l -p 8080                                        │       │
+│  │  Listening on: 192.168.1.100:8080  ← host's real IP  │       │
+│  │                                                       │       │
+│  │  Sees: host's eth0, host's routes, host's ports       │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                                                                  │
+│  From anywhere on the network:                                   │
+│  $ telnet 192.168.1.100 8080  ← connects directly, no NAT       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Multiple Ports — No Config Needed
+
+```bash
+# Inside a host-mode container, bind to as many ports as you want:
+nc -l -p 8080 &
+nc -l -p 8081 &
+nc -l -p 8082 &
+
+# All immediately accessible from outside — no --publish required
+```
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Host mode container                                  │
+│                                                       │
+│  :8080 ──── listening (nc)                            │
+│  :8081 ──── listening (nc)      All bound directly    │
+│  :8082 ──── listening (nc)      on host's interface   │
+│                                                       │
+│  From another machine:                                │
+│  $ telnet 192.168.1.100 8080  ✓                      │
+│  $ telnet 192.168.1.100 8081  ✓                      │
+│  $ telnet 192.168.1.100 8082  ✓                      │
+└──────────────────────────────────────────────────────┘
+```
+
+### Port Conflicts in Host Mode
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  HOST                                                         │
+│                                                               │
+│  nginx (host process) ─── listening on :80                    │
+│  container (--net=host) ─ tries to bind :80 → ERROR!          │
+│                                                               │
+│  Same port space = same conflict rules as any host process    │
+│  Privileged ports (<1024) still require root                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### When to Use Host Mode
+
+| Use case | Why host mode helps |
+|----------|-------------------|
+| VPN containers | NAT-sensitive; needs real IPs and TUN/TAP devices |
+| Performance-critical networking | Eliminates bridge/NAT overhead |
+| Apps binding many dynamic ports | No need to declare ports upfront |
+| Monitoring/debugging tools | Needs visibility into host network stack |
+| Legacy apps that don't work behind NAT | Sees real IPs, real interfaces |
+
+### When NOT to Use Host Mode
+
+| Scenario | Why bridge is better |
+|----------|---------------------|
+| Running multiple instances of same app | Port conflicts in host mode |
+| Multi-tenant / untrusted containers | No network isolation in host mode |
+| Microservices with service discovery | Bridge + DNS is more manageable |
+| Production web apps | Port publishing gives controlled exposure |
+
+---
+
+## Summary: Docker Network Drivers
+
+| Driver | Isolation | Ports | Use case |
+|--------|-----------|-------|----------|
+| **bridge** (default) | Full (own namespace, virtual IP) | Must `--publish` | Most containers |
+| **host** | None (shares host namespace) | All exposed automatically | VPN, perf-critical, many-port apps |
+| **none** | Full (no networking at all) | N/A | Security-hardened, batch jobs |
 
 | Method | Use case | How |
 |--------|----------|-----|
