@@ -985,6 +985,79 @@ The key insight: GitHub treats NTSK scale set as a **black box pool**. It assign
 
 ---
 
+## Listener Logging Configuration
+
+The listener pod (`ghalistener`) supports configurable log levels — it is **not** hardcoded to `info`.
+
+### How It Works
+
+1. The **controller's `--log-level` flag** (set in the Helm chart `gha-runner-scale-set-controller`) defaults to `debug`
+2. The controller propagates its log level to the listener pod's config JSON via `SetListenerLoggingParameters()`
+3. The listener reads `log_level` from its config file and creates a logger supporting: `debug`, `info`, `warn`, `error`
+
+### Configuring Log Level
+
+Set `flags.logLevel` in the controller's Helm values:
+
+```yaml
+# charts/gha-runner-scale-set-controller/values.yaml
+flags:
+  logLevel: "debug"   # valid: "debug", "info", "warn", "error"
+  logFormat: "text"   # valid: "text", "json"
+```
+
+### Code Path
+
+```
+Controller main.go
+  → flag.StringVar(&logLevel, "log-level", "debug", ...)
+  → SetListenerLoggingParameters(logLevel, logFormat)
+      → sets package-level vars: scaleSetListenerLogLevel, scaleSetListenerLogFormat
+      → these are written into the listener config JSON when the listener pod is created
+
+Listener cmd/ghalistener/main.go
+  → config.Read() parses JSON config (including log_level, log_format)
+  → config.Logger() calls logger.New(logLevel, logFormat)
+      → creates slog.Logger with the specified level
+```
+
+### No Image Rebuild Required
+
+Changing the log level does **not** require rebuilding the Docker image. The Helm values are just passed as command-line args to the existing container at deploy time:
+
+```yaml
+# charts/gha-runner-scale-set-controller/templates/deployment.yaml
+{{- with .Values.flags.logLevel }}
+- "--log-level={{ . }}"
+{{- end }}
+```
+
+The binary inside the image (`/manager`) already supports all log levels (`debug`, `info`, `warn`, `error`) — it's parsed via `flag.StringVar` at startup (`main.go:160`). You just need a `helm upgrade`:
+
+```bash
+helm upgrade <release-name> gha-runner-scale-set-controller \
+  --set flags.logLevel=debug
+```
+
+Or update your values file and run `helm upgrade -f values.yaml ...`. The controller pod will restart with the new arg, and subsequent listener pods it creates will inherit the new log level in their config JSON.
+
+### Key Files (actions-runner-controller repo)
+
+| File | Role |
+|------|------|
+| `charts/gha-runner-scale-set-controller/values.yaml` | Helm values with `flags.logLevel` |
+| `main.go:160` | Controller's `--log-level` flag definition |
+| `controllers/actions.github.com/constants.go:73` | Default: `debug` |
+| `controllers/actions.github.com/resourcebuilder.go:54` | `SetListenerLoggingParameters()` |
+| `cmd/ghalistener/config/config.go:42` | Listener config struct with `log_level` field |
+| `logger/logger.go` | `slog.Logger` factory supporting debug/info/warn/error |
+
+### Default Behavior
+
+The default log level for both the controller and listener is **`debug`** (not `info`). If you're seeing only info-level logs, something in your deployment is explicitly setting `--log-level=info` or the config JSON has `"log_level": "info"`.
+
+---
+
 ## CVE-2026-34040: Docker Authorization Plugin Bypass
 
 ### Overview
