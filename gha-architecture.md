@@ -2458,3 +2458,359 @@ T+300s+      Old ERS finalizer removed, fully cleaned up
 | Listener recreation | `autoscalingrunnerset_controller.go:271-284` | Hash comparison → delete listener |
 | Outdated path | `autoscalingrunnerset_controller.go:246-268` | `cleanUpResources()` on outdated |
 | ERS sorting | `autoscalingrunnerset_controller.go:1143` | Sort by creation time (newest first) |
+
+---
+
+## Deep Dive: RBAC & Secrets Setup (How the Listener Gets Permission)
+
+The listener pod needs to patch EphemeralRunnerSet and EphemeralRunner resources — but it runs in a **different namespace** than those resources. This cross-namespace permission model is one of the more complex aspects of the ARC architecture.
+
+### Namespace Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Controller Namespace (e.g., "arc-systems")                          │
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ /manager Pod     │  │ AutoscalingLis-  │  │ Listener Pod     │  │
+│  │ (controller)     │  │ tener CR         │  │ (ghalistener)    │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐                        │
+│  │ ServiceAccount   │  │ Config Secret    │                        │
+│  │ (for listener)   │  │ (listener config)│                        │
+│  └──────────────────┘  └──────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  Runner Namespace (e.g., "arc-runners")                              │
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ AutoscalingRun-  │  │ EphemeralRunner- │  │ EphemeralRunner  │  │
+│  │ nerSet CR        │  │ Set CR           │  │ CRs + Pods       │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐                        │
+│  │ Role             │  │ RoleBinding      │                        │
+│  │ (for listener)   │  │ (cross-namespace)│                        │
+│  └──────────────────┘  └──────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Key design: The listener pod lives in the **controller namespace** but the Role and RoleBinding live in the **runner namespace** (where the EphemeralRunnerSet lives). The RoleBinding references the ServiceAccount by namespace+name, enabling cross-namespace access.
+
+### RBAC Resources Created
+
+The AutoscalingListener controller creates these resources in sequence (one per reconcile loop):
+
+```
+Reconcile 1: Create ServiceAccount
+  → in: controller namespace
+  → name: <listener-name>
+  → owned by: AutoscalingListener CR
+
+Reconcile 2: Create Role
+  → in: RUNNER namespace (AutoscalingRunnerSetNamespace)
+  → name: <listener-name>
+  → rules: see below
+  → NOT owned by AutoscalingListener (cross-namespace ownership not possible)
+  → tracked via labels: auto-scaling-listener-namespace, auto-scaling-listener-name
+
+Reconcile 3: Create RoleBinding
+  → in: RUNNER namespace
+  → name: <listener-name>
+  → roleRef: the Role created above
+  → subject: ServiceAccount from controller namespace
+  → NOT owned by AutoscalingListener (cross-namespace)
+  → tracked via same labels
+
+Reconcile 4: Create Config Secret (if needed)
+Reconcile 5: Create Proxy Secret (if proxy configured)
+Reconcile 6: Create Listener Pod
+```
+
+### The Listener Role: Exact Permissions
+
+```go
+func rulesForListenerRole(resourceNames []string) []rbacv1.PolicyRule {
+    return []rbacv1.PolicyRule{
+        {
+            APIGroups:     []string{"actions.github.com"},
+            Resources:     []string{"ephemeralrunnersets"},
+            ResourceNames: resourceNames,  // ← scoped to ONE specific ERS by name
+            Verbs:         []string{"patch"},
+        },
+        {
+            APIGroups: []string{"actions.github.com"},
+            Resources: []string{"ephemeralrunners", "ephemeralrunners/status"},
+            Verbs:     []string{"patch"},
+        },
+    }
+}
+```
+
+Two rules:
+1. **Patch EphemeralRunnerSets** — limited to the specific ERS name (e.g., `my-runner-set-xyz123`)
+   - This is what the scaler uses to set `spec.replicas` and `spec.patchID`
+2. **Patch EphemeralRunners + status** — any runner in the namespace (not name-scoped)
+   - This is what `HandleJobStarted` uses to set job metadata on individual runners
+
+The listener CANNOT:
+- Create or delete EphemeralRunners (only the ERS controller does that)
+- Read/list EphemeralRunners (it doesn't need to — it gets info from GitHub messages)
+- Modify the AutoscalingRunnerSet or EphemeralRunnerSet beyond patching
+
+### Cross-Namespace RoleBinding
+
+The critical piece enabling cross-namespace access:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: <listener-name>
+  namespace: arc-runners         # ← in the RUNNER namespace
+subjects:
+- kind: ServiceAccount
+  name: <listener-name>
+  namespace: arc-systems         # ← references SA in CONTROLLER namespace
+roleRef:
+  kind: Role
+  name: <listener-name>
+  apiGroup: rbac.authorization.k8s.io
+```
+
+This works because Kubernetes RoleBindings can reference subjects from any namespace. The role grants permissions within the RoleBinding's namespace (arc-runners), while the subject (ServiceAccount) lives in a different namespace (arc-systems).
+
+### Role Update Mechanism
+
+When the EphemeralRunnerSet name changes (e.g., during a rolling update), the role must be updated to reference the new name:
+
+```go
+// In Reconcile():
+existingRuleHash := listenerRole.Labels["role-policy-rules-hash"]
+desiredRules := rulesForListenerRole([]string{autoscalingListener.Spec.EphemeralRunnerSetName})
+desiredRulesHash := hash.ComputeTemplateHash(&desiredRules)
+
+if existingRuleHash != desiredRulesHash {
+    // Update the role with new resource names
+    r.updateRoleForListener(ctx, listenerRole, desiredRules, desiredRulesHash, log)
+}
+```
+
+The role stores a hash of its rules in `labels["role-policy-rules-hash"]` for fast drift detection.
+
+### The Config Secret
+
+The listener pod receives its configuration via a mounted secret:
+
+```
+Secret: <listener-name>-config
+Namespace: controller namespace
+Data:
+  config.json: {
+    "configureURL": "https://github.com/org/repo",
+    "ephemeralRunnerSetNamespace": "arc-runners",
+    "ephemeralRunnerSetName": "my-runner-set-abc123",
+    "maxRunners": 10,
+    "minRunners": 2,
+    "runnerScaleSetID": 42,
+    "runnerScaleSetName": "my-runners",
+    "logLevel": "debug",
+    "logFormat": "text",
+    "metricsAddr": ":8080",
+    "metricsEndpoint": "/metrics",
+    "appConfig": {        // ← GitHub App or PAT credentials
+      "token": "...",     // or appID + installationID + privateKey
+      ...
+    }
+  }
+```
+
+The config includes:
+- **Target ERS** (namespace + name) — so the scaler knows what to patch
+- **GitHub credentials** — from the `appConfig` field (read from user's GitHub secret)
+- **Scale set ID** — for the scaleset library to communicate with GitHub
+- **Logging and metrics** configuration
+
+### Pod Configuration
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: <listener-name>
+  namespace: arc-systems          # controller namespace
+spec:
+  serviceAccountName: <listener-name>
+  restartPolicy: Never            # ← no restart; controller recreates on crash
+  terminationGracePeriodSeconds: 60
+  nodeSelector:
+    kubernetes.io/os: linux
+  containers:
+  - name: listener
+    image: ghcr.io/actions/gha-runner-scale-set-controller:0.13.1
+    command: ["/ghalistener"]
+    env:
+    - name: LISTENER_CONFIG_PATH
+      value: /etc/gha-listener/config.json
+    volumeMounts:
+    - name: listener-config
+      mountPath: /etc/gha-listener
+      readOnly: true
+  volumes:
+  - name: listener-config
+    secret:
+      secretName: <listener-name>-config
+```
+
+Key details:
+- `restartPolicy: Never` — K8s won't restart the pod; the AutoscalingListener controller detects termination and recreates it
+- The same image as the controller (two binaries in one image)
+- Config mounted as a secret volume, not env vars (avoids command-line exposure)
+- `terminationGracePeriodSeconds: 60` — allows graceful session closure with GitHub
+
+### How the Listener Authenticates to K8s
+
+The listener uses **in-cluster config** via the mounted ServiceAccount token:
+
+```go
+// In scaler.New():
+conf, err := rest.InClusterConfig()  // reads /var/run/secrets/kubernetes.io/serviceaccount/token
+clientset, err := kubernetes.NewForConfig(conf)
+```
+
+This automatically uses the ServiceAccount's token, which is projected into the pod by the kubelet. The token's permissions are defined by the Role + RoleBinding created above.
+
+### Config Secret Drift Detection
+
+The controller detects and handles config drift:
+
+```go
+func listenerConfigSecretDrifted(existing *corev1.Secret, desired *corev1.Secret) bool {
+    // Compare config.json data
+    if !bytes.Equal(existing.Data["config.json"], desired.Data["config.json"]) {
+        return true
+    }
+    // Compare labels and annotations
+    if !maps.Equal(existing.Labels, desired.Labels) { return true }
+    if !maps.Equal(existing.Annotations, desired.Annotations) { return true }
+    return false
+}
+```
+
+If the secret drifts (e.g., GitHub credentials rotated), the controller:
+1. Updates the secret in-place
+2. Deletes the listener pod (since volume contents may be cached)
+3. Pod gets recreated on next reconcile with fresh config
+
+### Cleanup Order
+
+When the AutoscalingListener is deleted, resources are cleaned up in this order:
+
+```
+1. Delete listener Pod
+2. Delete config Secret
+3. Delete proxy Secret (if exists)
+4. Delete RoleBinding (in runner namespace)
+5. Delete Role (in runner namespace)
+6. Delete ServiceAccount (in controller namespace)
+7. Remove finalizer from AutoscalingListener → deleted
+```
+
+The Role and RoleBinding are NOT owned by the AutoscalingListener (cross-namespace ownership isn't possible in K8s), so they must be explicitly deleted. They're tracked via labels:
+- `auto-scaling-listener-namespace: arc-systems`
+- `auto-scaling-listener-name: <listener-name>`
+
+### Watch Mechanism for Cross-Namespace Resources
+
+Since Role and RoleBinding can't use `Owns()` (wrong namespace), the controller uses `Watches()` with a label-based mapper:
+
+```go
+func (r *AutoscalingListenerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&v1alpha1.AutoscalingListener{}).
+        Owns(&corev1.Pod{}).
+        Owns(&corev1.ServiceAccount{}).
+        Watches(&rbacv1.Role{}, handler.EnqueueRequestsFromMapFunc(labelBasedWatchFunc)).
+        Watches(&rbacv1.RoleBinding{}, handler.EnqueueRequestsFromMapFunc(labelBasedWatchFunc)).
+        Complete(r)
+}
+
+// labelBasedWatchFunc maps Role/RoleBinding events back to AutoscalingListener:
+func labelBasedWatchFunc(obj client.Object) []reconcile.Request {
+    labels := obj.GetLabels()
+    namespace := labels["auto-scaling-listener-namespace"]
+    name := labels["auto-scaling-listener-name"]
+    // → enqueue reconcile for that AutoscalingListener
+}
+```
+
+### GitHub Credentials Flow
+
+The listener needs GitHub credentials to create the scaleset client. These flow through:
+
+```
+User creates Secret (github-config-secret) in RUNNER namespace
+  → Contains: PAT token OR GitHub App (appID, installationID, privateKey)
+
+AutoscalingListener controller reads the secret via GetAppConfig()
+  → Resolves it into an appconfig.AppConfig struct
+
+Controller embeds credentials into listener config Secret
+  → Written to controller namespace as <listener-name>-config
+
+Listener pod reads /etc/gha-listener/config.json
+  → Uses credentials to create scaleset.Client
+  → Client handles token exchange (App → installation token) internally
+```
+
+The user's GitHub secret stays in the runner namespace. The controller copies the necessary credentials into the listener's config secret in the controller namespace. This way:
+- The listener pod doesn't need access to the runner namespace for secrets
+- Credentials are scoped to what the listener needs
+- Rotation is handled by the controller detecting config drift
+
+### Security Model Summary
+
+| Principle | Implementation |
+|-----------|---------------|
+| Least privilege | Listener can only PATCH specific resources, not create/delete/list |
+| Name-scoped | ERS patch is scoped to a single ERS by name |
+| Cross-namespace isolation | Runner pods can't reach controller namespace resources |
+| No shared ServiceAccount | Each listener gets its own SA, Role, RoleBinding |
+| Credential isolation | GitHub secrets read by controller, not directly by listener |
+| Automatic cleanup | Finalizer ensures RBAC is removed when listener is deleted |
+| Drift detection | Config hash comparison on every reconcile |
+
+### Naming Convention
+
+All resources for a listener share the same base name:
+
+```
+Listener name:      <ars-name>-<hash8>-listener
+                    e.g., "my-runners-a1b2c3d4-listener"
+
+ServiceAccount:     same as listener name (in controller ns)
+Role:               same as listener name (in runner ns)
+RoleBinding:        same as listener name (in runner ns)
+Config Secret:      <listener-name>-config (in controller ns)
+Proxy Secret:       <listener-name>-proxy (in controller ns)
+Pod:                same as listener name (in controller ns)
+```
+
+The `<hash8>` suffix is derived from: `FNV(namespace + "@" + runnerGroup + "@" + configURL)[:8]`
+
+### Key Source Files
+
+| Component | File | Key functions |
+|-----------|------|---------------|
+| Listener controller | `autoscalinglistener_controller.go` | `Reconcile()`, `createServiceAccountForListener()`, `createRoleForListener()`, `createRoleBindingForListener()` |
+| Role rules | `resourcebuilder.go:796` | `rulesForListenerRole()` |
+| ServiceAccount builder | `resourcebuilder.go:458` | `newScaleSetListenerServiceAccount()` |
+| Role builder | `resourcebuilder.go:478` | `newScaleSetListenerRole()` |
+| RoleBinding builder | `resourcebuilder.go:509` | `newScaleSetListenerRoleBinding()` |
+| Config secret | `resourcebuilder.go:179` | `newScaleSetListenerConfig()` |
+| Pod builder | `resourcebuilder.go:251` | `newScaleSetListenerPod()` |
+| Naming | `resourcebuilder.go:772` | `scaleSetListenerName()` |
+| Cleanup | `autoscalinglistener_controller.go:324` | `cleanupResources()` |
+| Cross-ns watch | `autoscalinglistener_controller.go:776` | `SetupWithManager()` with `labelBasedWatchFunc` |
