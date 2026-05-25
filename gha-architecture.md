@@ -1488,3 +1488,311 @@ The upstream `scaleset` library handles all GitHub API communication. Key points
 - Stack traces in error messages require source modifications (the custom image from Jan 2026 incident had these patches)
 
 ---
+
+## Deep Dive: Listener ↔ Scaler ↔ K8s Interaction (Scaling Decisions)
+
+This section traces the full data path from a GitHub message arriving at the listener through to pods being created or deleted in the cluster.
+
+### Architecture Overview
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│  GitHub Actions Service                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ Message Queue (per scale set)                                       │  │
+│  │  - JobAvailable, JobStarted, JobCompleted messages                  │  │
+│  │  - Statistics snapshot on every response                            │  │
+│  └──────────┬──────────────────────────────────▲──────────────────────┘  │
+│             │ long-poll GET                     │ AcquireJobs POST        │
+│             │ (blocks until msg or timeout)     │                         │
+└─────────────┼──────────────────────────────────┼─────────────────────────┘
+              │                                  │
+              ▼                                  │
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Listener Pod (ghalistener binary)                                       │
+│  ┌────────────────┐     ┌──────────────────┐     ┌──────────────────┐   │
+│  │ scaleset lib   │────▶│ listener.Run()   │────▶│    Scaler        │   │
+│  │ SessionClient  │     │ message loop     │     │  (K8s patches)   │   │
+│  └────────────────┘     └──────────────────┘     └────────┬─────────┘   │
+└───────────────────────────────────────────────────────────┼─────────────┘
+                                                            │
+                                                            │ PATCH (merge-patch)
+                                                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  K8s API Server                                                          │
+│  ┌─────────────────────────────────┐    ┌──────────────────────────────┐ │
+│  │ EphemeralRunnerSet              │    │ EphemeralRunner              │ │
+│  │  spec.replicas = N              │    │  status.jobRequestID = X    │ │
+│  │  spec.patchID  = seq            │    │  status.jobID = Y           │ │
+│  └──────────────┬──────────────────┘    └──────────────────────────────┘ │
+│                 │ triggers reconcile                                      │
+│                 ▼                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │  EphemeralRunnerSet Controller (in /manager)                      │    │
+│  │  - Compares current runners vs spec.replicas                      │    │
+│  │  - Creates/deletes EphemeralRunner CRs                            │    │
+│  └──────────────┬───────────────────────────────────────────────────┘    │
+│                 │ triggers reconcile                                      │
+│                 ▼                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │  EphemeralRunner Controller (in /manager)                         │    │
+│  │  - Requests JIT token from GitHub                                 │    │
+│  │  - Creates runner Pod                                             │    │
+│  └──────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### The Message Loop (listener.Run)
+
+The listener runs a single-goroutine loop that long-polls the GitHub message queue:
+
+```
+listener.Run(ctx, scaler):
+  1. Read initial session statistics (TotalAssignedJobs)
+  2. Call scaler.HandleDesiredRunnerCount(initialAssignedJobs)
+  3. Loop forever:
+     a. GetMessage(lastMessageID, maxRunners)     ← blocks (long-poll)
+     b. If nil message (timeout/no work):
+        - Call scaler.HandleDesiredRunnerCount(latestStatistics.TotalAssignedJobs)
+        - Continue loop
+     c. If message received:
+        - Update lastMessageID
+        - handleMessage(scaler, msg)
+```
+
+The `handleMessage` sequence:
+
+```
+handleMessage(scaler, msg):
+  1. Store msg.Statistics as latestStatistics
+  2. DeleteMessage(msg.MessageID)                  ← ACK the message
+  3. If msg has JobAvailable messages:
+     - AcquireJobs(requestIDs)                    ← claim jobs from GitHub
+  4. For each JobStarted:
+     - scaler.HandleJobStarted(jobInfo)           ← patch EphemeralRunner status
+  5. For each JobCompleted:
+     - scaler.HandleJobCompleted(jobInfo)         ← sets dirty=true
+  6. scaler.HandleDesiredRunnerCount(msg.Statistics.TotalAssignedJobs)
+```
+
+Key insight: `HandleDesiredRunnerCount` is called on **every** iteration — even nil messages (timeouts). This ensures the system converges even if GitHub's statistics drift.
+
+### The Scaler: Computing Desired Runners
+
+The scaler (cmd/ghalistener/scaler/scaler.go) implements three methods:
+
+#### Formula
+
+```
+targetRunners = min(minRunners + assignedJobs, maxRunners)
+```
+
+- `assignedJobs` = `msg.Statistics.TotalAssignedJobs` (jobs assigned to this scale set, whether running or queued)
+- `minRunners` = configured minimum (ensures idle capacity)
+- `maxRunners` = configured maximum (cost cap)
+
+Example: minRunners=2, maxRunners=10, assignedJobs=5 → target = min(2+5, 10) = 7
+
+#### PatchID Deduplication Mechanism
+
+The scaler maintains a monotonically-increasing `patchSeq` counter:
+
+```go
+// scaler.setDesiredWorkerState(count):
+w.patchSeq++                                           // always increment
+targetRunnerCount := min(w.config.MinRunners + count, w.config.MaxRunners)
+
+desiredPatchID := w.patchSeq
+if !dirty && targetRunnerCount == oldTargetRunners && targetRunnerCount == w.config.MinRunners {
+    desiredPatchID = 0    // "no-op" signal — forces state without triggering scale
+}
+```
+
+Two modes:
+- **patchID > 0**: Normal patch. The EphemeralRunnerSet controller reacts to new patches.
+- **patchID == 0**: "Force state" patch. Used when nothing changed and we're at minRunners. Triggers a different code path in the controller (allows scale-down of stale runners).
+
+The `dirty` flag is set by `HandleJobStarted` and `HandleJobCompleted`. It forces a non-zero patchID even if the target count hasn't changed, ensuring the controller processes the event.
+
+#### The K8s Patch
+
+The scaler issues a **merge patch** to `EphemeralRunnerSet.spec`:
+
+```json
+{"spec": {"replicas": 7, "patchID": 42}}
+```
+
+This is done via raw REST client (`kubernetes.Clientset.RESTClient().Patch()`), not controller-runtime, because the listener pod runs outside the controller manager.
+
+### EphemeralRunnerSet Controller: Receiving the Patch
+
+When the `spec.replicas` or `spec.patchID` changes, the EphemeralRunnerSet controller reconciles:
+
+```
+Reconcile(ephemeralRunnerSet):
+  1. List all EphemeralRunners owned by this set
+  2. Classify by state: pending, running, finished, failed, deleting, outdated
+  3. Compute scaleTotal = pending + running + failed
+  4. Track latestPatchID = max patchID annotation across all EphemeralRunners
+
+  5. If spec.PatchID == 0 OR spec.PatchID != latestPatchID:
+     // This is a NEW patch we haven't acted on yet
+     
+     a. Cleanup finished runners (delete them)
+     
+     b. If scaleTotal < spec.Replicas:
+        → SCALE UP: create (spec.Replicas - scaleTotal) new EphemeralRunners
+        
+     c. If spec.PatchID > 0 AND scaleTotal >= spec.Replicas:
+        → DEFER SCALE DOWN: do nothing now (jobs may still be running)
+        
+     d. If spec.PatchID == 0 AND scaleTotal > spec.Replicas:
+        → SCALE DOWN: delete (scaleTotal - spec.Replicas) idle runners
+
+  6. Update status (currentReplicas, phase, counts)
+```
+
+#### PatchID as Idempotency Guard
+
+Each EphemeralRunner gets an annotation `actions.github.com/patch-id` = the patchID at creation time.
+
+The controller compares:
+- `spec.PatchID` (what the listener wants)
+- `latestPatchID` (max annotation among existing runners)
+
+If they match, the controller considers this patch already handled and skips scaling. This prevents double-scaling when a reconcile is triggered by unrelated events (e.g., runner status updates).
+
+#### Scale-Down Safety
+
+Scale-down is deliberately cautious:
+1. Only runners that are **registered** with GitHub (have `Status.RunnerID > 0`) are candidates
+2. Runners with an active job (`HasJob()`) are skipped
+3. Before K8s deletion, the runner is first removed from GitHub via `RemoveRunner(runnerID)`
+4. If GitHub returns `JobStillRunningError`, that runner is skipped
+5. Scale-down iterates oldest-first (sorted by creation timestamp)
+6. Pending runners come before running runners in the deletion order
+
+### HandleJobStarted: Runner Status Enrichment
+
+When a job starts, the listener patches the **individual EphemeralRunner's status**:
+
+```go
+scaler.HandleJobStarted(jobInfo):
+  1. Build merge patch with job metadata:
+     - status.jobRequestID
+     - status.jobRepositoryName  ("owner/repo")
+     - status.jobID
+     - status.workflowRunID
+     - status.jobWorkflowRef
+     - status.jobDisplayName
+  2. PATCH EphemeralRunners/<runnerName>/status
+  3. If not found → skip (runner already cleaned up)
+```
+
+This enrichment serves two purposes:
+- The EphemeralRunnerSet controller uses `HasJob()` to protect busy runners from scale-down
+- Observability: operators can see which runner is doing what via `kubectl get ephemeralrunners`
+
+### MaxCapacity: The Backpressure Signal
+
+The listener sends `X-ScaleSetMaxCapacity` header on every GetMessage request:
+
+```go
+req.Header.Set("X-ScaleSetMaxCapacity", strconv.Itoa(maxCapacity))
+```
+
+This tells GitHub: "I can handle up to N runners right now." GitHub uses this to:
+- Limit how many `JobAvailable` messages it sends in a batch
+- Avoid assigning more jobs to this scale set than it can handle
+
+The value comes from `listener.maxRunners` (an `atomic.Uint32`) which is set from `config.MaxRunners`. It can be dynamically updated via `listener.SetMaxRunners()`, though ARC doesn't use this dynamic path today.
+
+### AcquireJobs: Claiming Work
+
+When the message contains `JobAvailable` messages, the listener must explicitly claim them:
+
+```
+acquireAvailableJobs(jobsAvailable):
+  1. Extract all RunnerRequestIDs from JobAvailable messages
+  2. POST /<scalesets>/<id>/acquirejobs with the request IDs
+  3. GitHub returns which IDs were actually acquired (others may have been claimed by another listener)
+```
+
+This is a critical step — if the listener doesn't AcquireJobs, those jobs won't be assigned to this scale set and will eventually time out or go elsewhere.
+
+### Statistics Object
+
+Every message from GitHub includes a `RunnerScaleSetStatistic`:
+
+```go
+type RunnerScaleSetStatistic struct {
+    TotalAvailableJobs     int   // jobs waiting to be acquired
+    TotalAcquiredJobs      int   // jobs acquired but not yet assigned to a runner
+    TotalAssignedJobs      int   // jobs assigned to a runner (queued + running)
+    TotalRunningJobs       int   // jobs actively executing
+    TotalRegisteredRunners int   // runners registered with GitHub
+    TotalBusyRunners       int   // runners currently running a job
+    TotalIdleRunners       int   // runners idle (registered but no job)
+}
+```
+
+The scaling formula uses **TotalAssignedJobs** — this is the most accurate measure of "how many runners do we need?" because it includes both queued and running jobs.
+
+### Timing and Convergence
+
+```
+Time ─────────────────────────────────────────────────────────────────▶
+
+GitHub Queue     │ JobAvailable msg queued │
+                 │                         │
+Listener Poll    │    ← long-poll blocks → │ GetMessage returns
+                 │                         │ DeleteMessage (ACK)
+                 │                         │ AcquireJobs
+                 │                         │ HandleDesiredRunnerCount
+                 │                         │   → PATCH EphemeralRunnerSet
+                 │                         │
+K8s API          │                         │    EphemeralRunnerSet reconcile triggered
+                 │                         │      → create EphemeralRunner CRs
+                 │                         │
+                 │                         │    EphemeralRunner reconcile triggered
+                 │                         │      → request JIT token from GitHub
+                 │                         │      → create Pod
+                 │                         │
+Pod Scheduling   │                         │    Pod pending → scheduled → running
+                 │                         │    Runner registers with GitHub
+                 │                         │
+GitHub           │                         │    Assigns job to registered runner
+                 │                         │    Sends JobStarted message
+                 │                         │
+Listener Poll    │                         │    GetMessage returns JobStarted
+                 │                         │      → HandleJobStarted (patch runner status)
+                 │                         │      → HandleDesiredRunnerCount (may be same)
+```
+
+Typical end-to-end latency from job queued to pod running: **10-30 seconds** depending on:
+- Long-poll timing (immediate if listener is already waiting)
+- K8s scheduling (node availability, image pull)
+- JIT token request to GitHub (1-2 API calls)
+
+### Edge Cases and Failure Modes
+
+| Scenario | What happens |
+|----------|-------------|
+| Listener pod restarts | New session created; initial statistics re-evaluated; may temporarily double-patch |
+| Message queue token expires | Auto-refreshed (refreshMessageSession); transparent retry |
+| K8s PATCH conflict | Error returned to listener → listener crashes → restarts and re-evaluates |
+| AcquireJobs partially fails | Some jobs acquired, others not — GitHub reassigns unclaimed jobs in next batch |
+| Runner pod fails before registering | EphemeralRunner controller retries (5x with backoff: 5s, 10s, 20s, 40s, 80s) |
+| Scale-down race (job starts during delete) | GitHub returns JobStillRunningError → runner is skipped |
+| PatchID overflow | Wraps at MaxInt32 back to 0 (safe — 0 triggers force-state path) |
+
+### Key Source Files
+
+| Component | File | Critical Function |
+|-----------|------|-------------------|
+| Message loop | `github.com/actions/scaleset@v0.3.0/listener/listener.go` | `Run()`, `handleMessage()` |
+| Session/polling | `github.com/actions/scaleset@v0.3.0/session_client.go` | `GetMessage()`, `AcquireJobs()` |
+| Scaler | `cmd/ghalistener/scaler/scaler.go` | `HandleDesiredRunnerCount()`, `setDesiredWorkerState()` |
+| ERS controller | `controllers/actions.github.com/ephemeralrunnerset_controller.go` | `Reconcile()`, `deleteIdleEphemeralRunners()` |
+| Runner builder | `controllers/actions.github.com/resourcebuilder.go:622` | `newEphemeralRunner()` — stamps PatchID annotation |
+| Types | `github.com/actions/scaleset@v0.3.0/types.go` | `RunnerScaleSetStatistic`, `RunnerScaleSetMessage` |
