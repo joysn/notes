@@ -2156,3 +2156,305 @@ Attempt 6:
 | Types/Phases | `apis/actions.github.com/v1alpha1/ephemeralrunner_types.go` | `IsDone()`, `HasJob()`, phase constants |
 | Error types | `controllers/actions.github.com/error.go` | `retryableError`, `fatalError` |
 | Backoff config | `ephemeralrunner_controller.go:56-63` | `failedRunnerBackoff` array, `maxFailures = 5` |
+
+---
+
+## Deep Dive: Rolling Update Flow (What Happens When You Change the Runner Image)
+
+When you change any runner-affecting spec (image, env vars, volumes, labels, etc.) in the AutoscalingRunnerSet, the system performs a rolling update. The behavior depends on the configured **UpdateStrategy**: `immediate` (default) or `eventual`.
+
+### Change Detection: The Hash Mechanism
+
+Three hashes drive the update detection system:
+
+| Hash | Annotation | What it covers | Triggers |
+|------|-----------|----------------|----------|
+| `Hash()` | `actions.github.com/change-hash` | Entire ARS spec + labels | ARS status reset to Pending |
+| `RunnerSetSpecHash()` | `actions.github.com/runner-spec-hash` | GitHubConfigUrl, Secret, RunnerGroup, ScaleSetName, Proxy, TLS, **Template** | New EphemeralRunnerSet creation |
+| `ListenerSpecHash()` | `actions.github.com/runner-spec-hash` (on listener) | Full ARS spec | Listener pod recreation |
+
+The critical one for runner image changes is `RunnerSetSpecHash()`:
+
+```go
+func (ars *AutoscalingRunnerSet) RunnerSetSpecHash() string {
+    spec := &runnerSetSpec{
+        GitHubConfigUrl:    ars.Spec.GitHubConfigUrl,
+        GitHubConfigSecret: ars.Spec.GitHubConfigSecret,
+        RunnerGroup:        ars.Spec.RunnerGroup,
+        RunnerScaleSetName: ars.Spec.RunnerScaleSetName,
+        Proxy:              ars.Spec.Proxy,
+        GitHubServerTLS:    ars.Spec.GitHubServerTLS,
+        Template:           ars.Spec.Template,    // ← includes container image
+    }
+    return hash.ComputeTemplateHash(&spec)
+}
+```
+
+Any change to `.spec.template` (which includes container images, env vars, volumes, resource limits, etc.) will produce a different hash.
+
+### Overview: Two Update Strategies
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  User changes AutoscalingRunnerSet spec (e.g., runner image)            │
+└───────────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ARS Controller detects hash mismatch:                                   │
+│  latestRunnerSet.Annotations["runner-spec-hash"] ≠ ars.RunnerSetSpecHash │
+└───────────────────────────────┬─────────────────┬───────────────────────┘
+                                │                 │
+              ┌─────────────────┘                 └─────────────────┐
+              │ UpdateStrategy = "immediate"                         │ UpdateStrategy = "eventual"
+              ▼                                                      ▼
+┌─────────────────────────────────┐          ┌─────────────────────────────────┐
+│ 1. Delete listener              │          │ 1. Delete listener              │
+│ 2. Create NEW EphemeralRunnerSet│          │ 2. Patch old ERS replicas→0     │
+│    (replicas=0, new hash)       │          │ 3. Wait for all runners to      │
+│ 3. Delete OLD EphemeralRunnerSets│         │    finish (pending+running = 0) │
+│ 4. Create new listener          │          │ 4. Create NEW EphemeralRunnerSet│
+│    → listener starts scaling    │          │ 5. Delete OLD EphemeralRunnerSets│
+│    → old runners finish         │          │ 6. Create new listener          │
+│      naturally (ephemeral)      │          │    → listener starts scaling    │
+└─────────────────────────────────┘          └─────────────────────────────────┘
+```
+
+### Strategy: "immediate" (Default)
+
+This is the simpler and faster path. The system doesn't wait for existing runners to drain.
+
+#### Step-by-Step Flow
+
+```
+Time ──────────────────────────────────────────────────────────────────────▶
+
+1. ARS spec changes (e.g., container image updated via helm upgrade)
+   
+2. ARS Controller reconcile:
+   a. Detects changeHash mismatch → updates annotation, sets phase=Pending
+   
+3. Next reconcile:
+   a. Detects listenerValuesHashChanged or listenerSpecHashChanged
+   b. DELETE existing AutoscalingListener
+   c. Return (wait for listener deletion to propagate)
+
+4. Next reconcile:
+   a. listenerFound = false
+   b. Detects RunnerSetSpecHash mismatch:
+      latestRunnerSet.Annotations["runner-spec-hash"] ≠ ars.RunnerSetSpecHash()
+   c. drainingJobs() → returns FALSE (strategy is "immediate")
+   d. Calls createEphemeralRunnerSet():
+      - Creates NEW EphemeralRunnerSet with:
+        - replicas: 0
+        - annotation "runner-spec-hash" = new hash
+        - spec from updated ARS template
+
+5. Next reconcile:
+   a. latestRunnerSet = NEW runner set (sorted by creation time, newest first)
+   b. Hash now matches ✓
+   c. oldRunnerSets = [OLD runner set] → delete them
+   d. listenerFound = false → create new AutoscalingListener
+
+6. AutoscalingListener Controller:
+   - Creates listener pod with new config
+   - Listener starts polling GitHub
+   - Reports initial statistics
+   - Starts scaling new EphemeralRunnerSet
+
+7. OLD EphemeralRunnerSet being deleted:
+   - Finalizer blocks actual deletion
+   - Old runners that are RUNNING jobs continue until done
+   - EphemeralRunnerSet controller cleans up finished runners
+   - Once all runners are gone, finalizer removed, ERS deleted
+```
+
+**Key insight**: With `immediate`, you may temporarily have TWO sets of runners:
+- Old runners finishing their current jobs (can't be killed mid-job)
+- New runners being created by the new listener for new jobs
+
+This causes **overprovisioning** proportional to how many jobs are currently running.
+
+### Strategy: "eventual"
+
+This prevents overprovisioning by waiting for all existing runners to finish before creating new ones.
+
+#### Step-by-Step Flow
+
+```
+Time ──────────────────────────────────────────────────────────────────────▶
+
+1. ARS spec changes
+
+2. ARS Controller reconcile:
+   a. Detects hash mismatch
+   b. DELETE existing AutoscalingListener
+
+3. Next reconcile:
+   a. Detects RunnerSetSpecHash mismatch
+   b. drainingJobs() → checks:
+      latestRunnerSetStatus.RunningEphemeralRunners + PendingEphemeralRunners > 0?
+   c. If YES (jobs still running):
+      - Patches old EphemeralRunnerSet: replicas=0, patchID=0
+        (this tells the ERS controller to scale down idle runners)
+      - Returns (does NOT create new ERS yet)
+      - Will requeue and check again
+
+4. Subsequent reconciles (while draining):
+   a. Same check: running + pending > 0?
+   b. Keeps patching replicas=0 (idempotent)
+   c. Runners with active jobs continue until done
+   d. Idle runners get scaled down
+   e. Eventually: running=0, pending=0
+
+5. Once drained (running + pending = 0):
+   a. drainingJobs() → FALSE
+   b. Creates NEW EphemeralRunnerSet
+   c. Proceeds same as "immediate" from step 5 onward
+
+6. Later: Listener not found → but drainingJobs() still applies!
+   If runners are still draining when the listener creation check is reached:
+   - "Creating a new AutoscalingListener is waiting for the running
+     and pending runners to finish"
+   - Returns without creating listener
+```
+
+**Key insight**: With `eventual`, there's a **blackout period** where no new jobs can be picked up (no listener running, no new runners being created). Jobs queued during this window wait until the new listener comes up.
+
+### The "Outdated" Path (Exit Code 7)
+
+A third update path exists — triggered from the runner binary itself rather than a spec change:
+
+```
+1. GitHub Actions service has a newer runner version available
+2. Runner binary detects this and exits with code 7
+3. EphemeralRunner controller: markAsOutdated()
+   → Sets EphemeralRunner.Status.Phase = "Outdated"
+4. EphemeralRunnerSet controller: updateStatus()
+   → Detects outdated runners
+   → Sets EphemeralRunnerSet.Status.Phase = "Outdated"
+5. ARS Controller:
+   → Detects latestRunnerSet.Status.Phase == EphemeralRunnerSetPhaseOutdated
+   → Sets ARS phase to "Outdated"
+   → Calls cleanUpResources():
+     a. Delete listener
+     b. Delete all EphemeralRunnerSets
+     c. Delete RunnerScaleSet from GitHub
+   → Once clean, ARS reconciles from scratch:
+     - Creates new RunnerScaleSet on GitHub
+     - Creates new EphemeralRunnerSet
+     - Creates new listener
+```
+
+This is the most disruptive path — it tears everything down and recreates from scratch, including the GitHub-side scale set registration.
+
+### The EphemeralRunnerSets Sorting
+
+The controller maintains multiple EphemeralRunnerSets during transitions:
+
+```go
+type EphemeralRunnerSets struct { list }
+
+func (rs *EphemeralRunnerSets) latest()  // newest by creation time (the "current" one)
+func (rs *EphemeralRunnerSets) old()     // all except newest (to be cleaned up)
+func (rs *EphemeralRunnerSets) all()     // everything
+
+// Sort: newest first (After, not Before)
+sort.Slice(rs.list.Items, func(i, j int) bool {
+    return rs.list.Items[i].GetCreationTimestamp().After(
+        rs.list.Items[j].GetCreationTimestamp().Time)
+})
+```
+
+After a spec change, the system briefly has:
+- `latest()` = the new ERS (matches current hash)
+- `old()` = [old ERS] (hash mismatch, being drained/deleted)
+
+### Listener Recreation
+
+The listener is recreated when either:
+1. `annotationKeyValuesHash` changed (any ARS spec field)
+2. `annotationKeyRunnerSpecHash` on listener doesn't match `ListenerSpecHash()`
+
+The listener points to a **specific EphemeralRunnerSet by name** in its config:
+```go
+func createAutoScalingListenerForRunnerSet(ars, ephemeralRunnerSet):
+    // The listener's config includes:
+    config.EphemeralRunnerSetName = ephemeralRunnerSet.Name
+    config.EphemeralRunnerSetNamespace = ephemeralRunnerSet.Namespace
+```
+
+This is why the listener MUST be recreated on update — it needs to point to the new EphemeralRunnerSet.
+
+### New EphemeralRunnerSet Starts at Replicas=0
+
+Critically, a newly created EphemeralRunnerSet always starts with `replicas: 0`:
+
+```go
+Spec: v1alpha1.EphemeralRunnerSetSpec{
+    Replicas: 0,    // ← always starts empty
+    ...
+}
+```
+
+It only scales up once the new listener is created, connects to GitHub, receives the initial session statistics, and patches the desired count.
+
+### What "Changing the Runner Image" Actually Means
+
+When you do `helm upgrade` with a new runner image:
+
+1. Helm updates the `AutoscalingRunnerSet` CR's `.spec.template.spec.containers[].image`
+2. This changes `RunnerSetSpecHash()` (because `Template` is included in the hash)
+3. The rolling update flow kicks in
+4. Existing runner pods keep their old image until they finish
+5. New runner pods use the new image
+
+The controller itself (`/manager`) and listener (`/ghalistener`) images are NOT affected by this change — those are controlled by the controller Helm chart (`gha-runner-scale-set-controller`), not the runner set chart (`gha-runner-scale-set`).
+
+### Comparison Table
+
+| Aspect | Immediate | Eventual |
+|--------|-----------|----------|
+| Downtime (no new jobs) | Minimal (listener recreated quickly) | Longer (waits for drain) |
+| Overprovisioning | Yes (old + new runners coexist) | No |
+| Job safety | Running jobs always complete | Running jobs always complete |
+| Cost impact | Temporarily higher (2x runners possible) | No cost spike |
+| Complexity | Simpler | More states to manage |
+| Default | Yes | No |
+| Best for | Small scale, fast deploys | Large scale, cost-sensitive |
+
+### Practical Timeline: Image Update with "immediate"
+
+```
+T+0s    helm upgrade (image changes in ARS spec)
+T+1s    ARS controller detects hash change, deletes listener
+T+2s    Listener pod terminating, session closed with GitHub
+T+3s    ARS controller creates new EphemeralRunnerSet (replicas=0)
+T+4s    ARS controller deletes old EphemeralRunnerSet
+T+5s    ARS controller creates new AutoscalingListener
+T+7s    AutoscalingListener controller creates listener pod
+T+10s   Listener pod running, session created with GitHub
+T+11s   Initial statistics received, listener patches ERS replicas
+T+12s   EphemeralRunnerSet controller creates new EphemeralRunners
+T+15s   New runner pods starting (new image)
+T+20s   New runners registered and picking up jobs
+
+Meanwhile:
+T+0s onward  Old runners still executing their current jobs
+T+30-300s    Old runners finishing, old ERS draining
+T+300s+      Old ERS finalizer removed, fully cleaned up
+```
+
+### Key Source Files
+
+| Component | File | Key function |
+|-----------|------|-------------|
+| Update detection | `autoscalingrunnerset_controller.go:287` | Hash comparison on `latestRunnerSet` |
+| Strategy check | `autoscalingrunnerset_controller.go:394` | `drainingJobs()` |
+| New ERS creation | `autoscalingrunnerset_controller.go:709` | `createEphemeralRunnerSet()` |
+| Hash computation | `apis/.../autoscalingrunnerset_types.go:390` | `RunnerSetSpecHash()` |
+| ERS builder | `resourcebuilder.go:555` | `newEphemeralRunnerSet()` — stamps hash annotation |
+| Old ERS cleanup | `autoscalingrunnerset_controller.go:306` | `deleteEphemeralRunnerSets(oldRunnerSets)` |
+| Listener recreation | `autoscalingrunnerset_controller.go:271-284` | Hash comparison → delete listener |
+| Outdated path | `autoscalingrunnerset_controller.go:246-268` | `cleanUpResources()` on outdated |
+| ERS sorting | `autoscalingrunnerset_controller.go:1143` | Sort by creation time (newest first) |
