@@ -1,972 +1,27 @@
-# Kubernetes Operators & GitHub Actions ARC (Actions Runner Controller)
+# GitHub Actions ARC — Architecture Deep Dive
 
-## Kubernetes Operators
+## 1. Overview & Architecture at a Glance
 
-### What is an Operator?
+ARC (Actions Runner Controller) is a Kubernetes operator that provides autoscaled, ephemeral GitHub Actions self-hosted runners. Instead of manually managing VMs, you declare scaling bounds and ARC dynamically creates/destroys runner pods based on workflow demand.
 
-An Operator is a software extension to Kubernetes that uses **Custom Resources** to manage applications. It encodes the domain knowledge of a human operator (deploy, scale, heal, upgrade) into a controller that runs continuously.
-
-### Key Building Blocks
-
-| Concept | What it is |
-|---------|-----------|
-| **Custom Resource (CR)** | A new "kind" you add to the K8s API (e.g., `kind: RunnerScaleSet`) |
-| **Custom Resource Definition (CRD)** | The schema that defines your CR (like a table DDL for the API) |
-| **Controller** | A loop that watches CRs and reconciles actual state → desired state |
-| **Operator** | Controller + CRD + domain logic, packaged together |
-
-### The Control Loop (Reconcile)
+### High-Level Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│         Observe (watch API)             │
-│              ↓                          │
-│   Compare desired state vs actual state │
-│              ↓                          │
-│         Act (create/update/delete)      │
-│              ↓                          │
-│         Loop forever                    │
-└─────────────────────────────────────────┘
+┌───────────────────────────────────────────────┐  ┌──────────────────────────────────────────────┐
+│         GITHUB (their infra)                  │  │           YOUR INFRASTRUCTURE (K8s)          │
+│                                               │  │                                              │
+│  ┌───────────┐  ┌───────────────┐             │  │  ┌────────────┐  ┌──────────┐  ┌───────────┐│
+│  │ Actions   │  │ Runner        │             │  │  │ ARC        │  │ Listener │  │ Runner    ││
+│  │ Service   │  │ Registration  │             │  │  │ Controller │  │ Pod      │  │ Pod(s)    ││
+│  └───────────┘  └───────────────┘             │  │  └────────────┘  └──────────┘  └───────────┘│
+│  ┌───────────┐  ┌───────────────┐             │  │                                              │
+│  │ Job Queue │  │ GitHub UI /   │             │  │  ┌────────────────────────────────────────┐  │
+│  │           │  │ API + Checks  │             │  │  │ Kubernetes API Server                  │  │
+│  └───────────┘  └───────────────┘             │  │  └────────────────────────────────────────┘  │
+└───────────────────────────────────────────────┘  └──────────────────────────────────────────────┘
 ```
 
-The controller continuously:
-1. **Observes** — watches the K8s API for changes to its CRs
-2. **Diffs** — compares what *should* exist vs what *does* exist
-3. **Acts** — creates Pods, Services, Jobs, etc. to close the gap
-
-### What Operators Can Automate
-
-- Deploying an application on demand
-- Taking and restoring backups of application state
-- Handling upgrades of application code alongside related changes (database schemas, configuration settings)
-- Simulating failure in all or part of your cluster to test resilience
-- Choosing a leader for a distributed application without an internal member election process
-
-### Operator vs. Deployment/ReplicaSet
-
-A Deployment/ReplicaSet gives you: "keep N pods alive." An Operator gives you: "keep the *application in a correct state*."
-
-| Layer | ReplicaSet does this | Operator adds this |
-|-------|---------------------|-------------------|
-| Pod dies | Replaces it with a new pod | Deregisters the dead runner from GitHub, registers the new one, ensures no orphaned tokens |
-| Pod is running but broken | Nothing (pod is "Ready") | Detects runner is stuck/unresponsive via external API, drains and replaces it |
-| Job finishes | Nothing | Tears down the runner pod (ephemeral runners), scales down to save resources |
-| Scaling | Fixed replica count (or HPA on CPU/memory) | Scales based on **external state** (e.g., queued GitHub jobs) that a ReplicaSet can't see |
-
----
-
-## GitHub Actions ARC — Runner Scale Sets
-
-### What is a Runner Scale Set?
-
-A Runner Scale Set is the deployment unit in ARC — a named, autoscaled pool of self-hosted runners registered to a GitHub repository, organization, or enterprise. Deployed via Helm charts and managed by the ARC operator.
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────┐  ┌──────────────────────────────────────────────┐
-│         GITHUB (their infra)                        │  │           NTSK INFRASTRUCTURE (K8s)          │
-│                                                     │  │                                              │
-│  ┌───────────┐  ┌───────────────┐                   │  │  ┌────────────┐  ┌──────────┐  ┌───────────┐ │
-│  │ Actions   │  │ Runner        │                   │  │  │ ARC        │  │ Listener │  │ Runner    │ │
-│  │ Service   │  │ Registration  │                   │  │  │ Controller │  │ Pod      │  │ Pod(s)    │ │
-│  │           │  │ Service       │                   │  │  │            │  │          │  │           │ │
-│  └───────────┘  └───────────────┘                   │  │  └────────────┘  └──────────┘  └───────────┘ │
-│  ┌───────────┐  ┌───────────────┐                   │  │                                              │
-│  │ Job Queue │  │ GitHub UI /   │                   │  │  ┌────────────────────────────────────────┐  │
-│  │           │  │ API + Checks  │                   │  │  │ Kubernetes API Server                  │  │
-│  └───────────┘  └───────────────┘                   │  │  └────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘  └──────────────────────────────────────────────┘
-```
-
-### How ARC Maps to Operator Concepts
-
-| Operator concept | ARC equivalent |
-|-----------------|----------------|
-| CRD | `RunnerScaleSet`, `AutoscalingRunnerSet`, `EphemeralRunnerSet` |
-| Custom Resource | Your YAML declaring "I want 3-10 runners for repo X" |
-| Controller | ARC's controller pod watching for workflow jobs |
-| Reconcile loop | Scale runners up when jobs queue, scale down when idle |
-| Domain knowledge | "How to register/deregister GitHub runners, handle graceful drain" |
-
-### Scale Set Configuration
-
-Key fields in the Helm values:
-
-| Field | Purpose |
-|-------|---------|
-| `runnerScaleSetName` | The `runs-on:` label your workflows target |
-| `githubConfigUrl` | Scope: repo, org, or enterprise |
-| `minRunners` / `maxRunners` | Scaling bounds |
-| `containerMode` | `dind`, `kubernetes`, or none |
-| `template.spec` | Pod spec for runners (image, resources, volumes) |
-
-### Scaling Configurations
-
-| Config | Behavior |
-|--------|----------|
-| Both omitted | 0 → ∞ (unbounded, scales to zero when idle) |
-| `minRunners: 5` | Always 5 warm runners ready, scales up from there |
-| `maxRunners: 30` | Never exceed 30 concurrent runners |
-| Both set to `0` | Drains — no new runners created |
-
-Formula: `desired = minRunners + queued_jobs` (capped at `maxRunners`)
-
-### Scale Set vs. Runner Group
-
-- A **runner group** (GitHub concept) is an access-control boundary — "which repos can use these runners"
-- A **scale set** (ARC/K8s concept) is a deployment unit — "a pool of pods with specific resources, scaling rules, and container mode"
-
-You can have multiple scale sets in the same runner group (e.g., `linux-small` with 2 CPU, `linux-gpu` with a GPU node selector).
-
----
-
-## End-to-End Control Flow
-
-### Phase 1: Scale Set Registration (One-time setup)
-
-```
-NTSK K8s                                         GITHUB
-─────────                                        ──────
-
-helm install arc-runner-set ...
-        │
-        ▼
-┌────────────┐                               ┌──────────────────┐
-│ ARC        │───── POST /runner-groups ────▶│ Runner           │
-│ Controller │      /scale-sets              │ Registration     │
-│            │◀──── 201: scaleSetId ──────── │ Service          │
-└────────────┘                               └──────────────────┘
-        │                                          │
-        │  (creates Listener pod)                  ▼
-        ▼                                   ┌──────────────────┐
-┌────────────┐                              │ GitHub UI:       │
-│ Listener   │───── Long-poll session ─────▶│ "Scale set       │
-│ Pod        │      (authenticated)         │  registered,     │
-│            │      waiting for jobs...     │  0 runners idle" │
-└────────────┘                              └──────────────────┘
-
-API calls:
-  1. Register scale set (name, runner group, labels)
-  2. Acquire message session (long-poll channel for job assignments)
-```
-
-### Phase 2: Job Triggered → Runner Created
-
-```
-Developer pushes code / opens PR
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ GITHUB ACTIONS SERVICE                                      │
-│                                                             │
-│  1. Workflow triggered (push/PR/manual)                     │
-│  2. Job parsed: runs-on: "my-k8s-runners"                   │
-│  3. Job enters QUEUED state                                 │
-│  4. GitHub UI: job shows "Queued" ⏳                        │
-│  5. Actions service matches label → NTSK scale set          │
-│  6. Assigns job to scale set → pushes to message session    │
-└──────────────────────────────────┬──────────────────────────┘
-                                   │
-                job assignment message (long-poll response)
-                                   │
-                                   ▼
-NTSK K8s ─────────────────────────────────────────────────────
-                                   │
-                        ┌──────────▼─────────┐
-                        │ Listener Pod       │
-                        │  Receives:         │
-                        │   - jobId          │
-                        │   - jobUrl         │
-                        │   - runnerRequest  │
-                        └──────────┬─────────┘
-                                   │
-                  (updates EphemeralRunnerSet CR via K8s API)
-                                   │
-                        ┌──────────▼─────────┐
-                        │ ARC Controller     │
-                        │  Reconcile loop:   │
-                        │   desired=1 runner │
-                        │   actual=0 runners │
-                        │   → create pod     │
-                        └──────────┬─────────┘
-                                   │
-                        ┌──────────▼─────────┐
-                        │ K8s API Server     │
-                        │  → schedules pod   │
-                        │  → node pulls image│
-                        │  → pod starts      │
-                        └──────────┬─────────┘
-                                   │
-                        ┌──────────▼──────────┐
-                        │ Runner Pod (started)│
-                        └─────────────────────┘
-```
-
-### Phase 3: Runner Registration → Job Execution
-
-```
-NTSK K8s                                          GITHUB
-─────────                                         ──────
-
-┌────────────────┐                          ┌──────────────────┐
-│ Runner Pod     │                          │ Runner           │
-│                │                          │ Registration Svc │
-│ 1. run.sh      │                          │                  │
-│    starts      │                          │                  │
-│                │                          │                  │
-│ 2. Register    │── POST /runners ────────▶│ Creates runner   │
-│    as JIT      │   (Just-In-Time token)   │ record           │
-│    runner      │◀─ 200: runnerId ─────────│                  │
-│                │                          └──────────────────┘
-│                │                                 │
-│                │                                 ▼
-│                │                          ┌──────────────────┐
-│                │                          │ GitHub UI:       │
-│ 3. Poll for    │── GET /messages ────────▶│ Runner "idle" 🟢 │
-│    job         │◀─ job payload ───────────│ Job → "In        │
-│                │                          │ Progress" 🟡     │
-│                │                          └──────────────────┘
-│                │
-│ 4. Execute     │
-│    steps:      │
-│    - checkout  │
-│    - run cmds  │
-│    - actions   │
-│                │
-│   DURING EXECUTION, runner calls          GitHub UI
-│   GitHub API periodically:                (streaming)
-│    • POST /live logs ─────────────────────▶ Live log output
-│    • POST /timeline ──────────────────────▶ Step status updates
-│    • POST /annotations ───────────────────▶ Warnings/errors
-│    • PUT /artifacts ──────────────────────▶ Artifact storage
-│    • GET/POST /caches ────────────────────▶ Cache service
-│                │
-└────────────────┘
-```
-
-### Phase 4: Job Completion → Cleanup
-
-```
-NTSK K8s                                          GITHUB
-─────────                                         ──────
-
-┌────────────────┐                           ┌──────────────────┐
-│ Runner Pod     │                           │ Actions Service  │
-│                │                           │                  │
-│ 5. All steps   │── POST /complete ───────▶ │ Job → "Success"  │
-│    finished    │   {result: "succeeded"}   │ or "Failed" ✅❌  │
-│                │                           │                  │
-│ 6. Deregister  │── DELETE /runners/{id} ──▶│ Runner removed   │
-│    self        │                           │ from pool        │
-│                │                           │                  │
-│ 7. Process     │                           │ GitHub UI:       │
-│    exits(0)    │                           │ "Run completed"  │
-└───────┬────────┘                           │ Shows logs,      │
-        │                                    │ duration, status │
-        │ (pod terminates)                   └──────────────────┘
-        ▼
-┌────────────────┐
-│ ARC Controller │
-│                │
-│ Watches pod:   │
-│  phase=Succeed │
-│                │
-│ Reconcile:     │
-│  desired=0     │
-│  actual=1(done)│
-│  → delete pod  │
-│                │
-│ Cleans up:     │
-│  - Pod         │
-│  - PVC (if any)│
-│  - Secrets     │
-└───────┬────────┘
-        │
-        ▼
-┌────────────────┐                          ┌──────────────────┐
-│ Listener Pod   │                          │ Actions Service  │
-│                │                          │                  │
-│ Acks job       │── ACK job complete ─────▶│ Updates stats:   │
-│ completion     │                          │  - billable mins │
-│                │                          │  - queue time    │
-│ Resumes        │                          │  - run duration  │
-│ long-poll...   │                          │                  │
-│ (waiting for   │                          │ Triggers:        │
-│  next job)     │                          │  - dependent jobs│
-│                │                          │  - notifications │
-│                │                          │  - status checks │
-└────────────────┘                          └──────────────────┘
-```
-
----
-
-## Deep Dive: Runner Pod Registration Process
-
-### CRD Hierarchy
-
-```
-AutoScalingRunnerSet          (user-facing, installed via Helm)
-  └── EphemeralRunnerSet      (manages desired replica count)
-       └── EphemeralRunner    (represents one runner instance)
-            └── Runner Pod    (actual container executing the job)
-```
-
-### Component Responsibilities
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ NTSK KUBERNETES CLUSTER                                                         │
-│                                                                                 │
-│  ┌──────────────────────────────────┐                                           │
-│  │ Controller Manager Pod           │                                           │
-│  │                                  │                                           │
-│  │  ┌────────────────────────────┐  │                                           │
-│  │  │ AutoScalingRunnerSet Ctrl  │──┼──── Registers scale set with GitHub       │
-│  │  └────────────────────────────┘  │                                           │
-│  │  ┌────────────────────────────┐  │                                           │
-│  │  │ AutoScaling Listener Ctrl  │──┼──── Creates/manages the Listener pod      │
-│  │  └────────────────────────────┘  │                                           │
-│  │  ┌────────────────────────────┐  │                                           │
-│  │  │ EphemeralRunner Controller │──┼──── Requests JIT tokens, creates pods     │
-│  │  └────────────────────────────┘  │                                           │
-│  └──────────────────────────────────┘                                           │
-│                                                                                 │
-│  ┌──────────────────────────────────┐                                           │
-│  │ Listener Pod                     │                                           │
-│  │  - Long-polls GitHub Actions Svc │                                           │
-│  │  - Patches EphemeralRunnerSet    │                                           │
-│  │    via ServiceAccount/Role       │                                           │
-│  └──────────────────────────────────┘                                           │
-│                                                                                 │
-│  ┌──────────────────────────────────┐                                           │
-│  │ Runner Pod (ephemeral)           │                                           │
-│  │  - Starts with JIT config ONLY   │                                           │
-│  │  - NO PAT/App token on pod       │                                           │
-│  │  - Registers, runs 1 job, dies   │                                           │
-│  └──────────────────────────────────┘                                           │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Full Sequence: Job Assigned → Runner Pod Registered & Running
-
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│   Actions    │    │  Listener    │    │ K8s API +    │    │ Ephemeral    │    │  Runner      │
-│   Service    │    │  Pod         │    │ EphRunnerSet │    │ Runner Ctrl  │    │  Pod         │
-└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-       │                   │                   │                   │                   │
-       │ ① "Job Available" │                   │                   │                   │
-       │  (long-poll msg)  │                   │                   │                   │
-       │──────────────────▶│                   │                   │                   │
-       │                   │                   │                   │                   │
-       │   ② ACK message   │                   │                   │                   │
-       │◀──────────────────│                   │                   │                   │
-       │                   │                   │                   │                   │
-       │                   │ ③ PATCH           │                   │                   │
-       │                   │   EphemeralRunner │                   │                   │
-       │                   │   Set replicas+1  │                   │                   │
-       │                   │──────────────────▶│                   │                   │
-       │                   │                   │                   │                   │
-       │                   │                   │ ④ Creates         │                   │
-       │                   │                   │   EphemeralRunner │                   │
-       │                   │                   │   resource        │                   │
-       │                   │                   │──────────────────▶│                   │
-       │                   │                   │                   │                   │
-       │  ⑤ Request JIT    │                   │                   │                   │
-       │    config token   │                   │                   │                   │
-       │◀──────────────────────────────────────────────────────────│                   │
-       │                   │                   │                   │                   │
-       │  ⑥ Return         │                   │                   │                   │
-       │    encoded_jit_   │                   │                   │                   │
-       │    config         │                   │                   │                   │
-       │──────────────────────────────────────────────────────────▶│                   │
-       │                   │                   │                   │                   │
-       │                   │                   │                   │ ⑦ Create Pod     │
-       │                   │                   │                   │   with JIT config │
-       │                   │                   │                   │   (retry up to 5x)│
-       │                   │                   │                   │──────────────────▶│
-       │                   │                   │                   │                   │
-       │                   │                   │                   │                   │ ⑧ Pod starts
-       │                   │                   │                   │                   │   run.sh
-       │                   │                   │                   │                   │   --jitconfig
-       │                   │                   │                   │                   │   ${encoded}
-       │                   │                   │                   │                   │
-       │  ⑨ Register with JIT token (runner identifies itself)    │                   │
-       │◀─────────────────────────────────────────────────────────────────────────────│
-       │                   │                   │                   │                   │
-       │  ⑩ ACK registration (runnerId assigned)                  │                   │
-       │─────────────────────────────────────────────────────────────────────────────▶│
-       │                   │                   │                   │                   │
-       │  ⑪ Long-poll for job details                             │                   │
-       │◀─────────────────────────────────────────────────────────────────────────────│
-       │                   │                   │                   │                   │
-       │  ⑫ Dispatch job payload (steps, env, secrets refs)       │                   │
-       │─────────────────────────────────────────────────────────────────────────────▶│
-       │                   │                   │                   │                   │
-       │                   │                   │                   │                   │ ⑬ Execute job
-       │                   │                   │                   │                   │    steps...
-       │                   │                   │                   │                   │
-```
-
-### Step-by-Step Explanation
-
-| Step | Who | Does What | API Call |
-|------|-----|-----------|----------|
-| ① | GitHub Actions Service | Pushes "job available" to Listener's long-poll session | Internal (long-poll response) |
-| ② | Listener Pod | Acknowledges receipt of the job message | HTTPS to Actions Service |
-| ③ | Listener Pod | Patches EphemeralRunnerSet desired count +1 | K8s API (via ServiceAccount) |
-| ④ | EphemeralRunnerSet | Creates a new EphemeralRunner CR | K8s internal reconcile |
-| ⑤ | EphemeralRunner Controller | Requests a JIT config token for this specific runner | `POST /orgs/{org}/actions/runners/generate-jitconfig` |
-| ⑥ | GitHub | Returns `encoded_jit_config` containing identity + credentials | Response to ⑤ |
-| ⑦ | EphemeralRunner Controller | Creates the Runner Pod, injecting JIT config (retries up to 5x) | K8s API: create Pod |
-| ⑧ | Runner Pod | Starts `run.sh --jitconfig ${encoded_jit_config}` | Local process |
-| ⑨ | Runner Pod | Registers itself using the JIT token | `POST /actions/runners` (with JIT token) |
-| ⑩ | GitHub | Confirms registration, assigns a runner ID | Response to ⑨ |
-| ⑪ | Runner Pod | Opens long-poll connection waiting for job dispatch | HTTPS long-poll to Actions Service |
-| ⑫ | GitHub | Sends full job payload (steps, variables, secret refs) | Long-poll response |
-| ⑬ | Runner Pod | Executes workflow steps | Local execution |
-
-### The JIT Config — What's Inside
-
-The `encoded_jit_config` is a base64-encoded blob containing everything the runner needs to connect:
-
-```
-┌─────────────────────────────────────────────────────┐
-│ encoded_jit_config (opaque to you, used by runner)  │
-│                                                     │
-│  • Runner name + ID (pre-registered with GitHub)    │
-│  • Runner group assignment                          │
-│  • Labels (matching NTSK scale set)                 │
-│  • OAuth credentials (short-lived, scoped to this   │
-│    runner only)                                     │
-│  • Actions Service URL (endpoint to connect to)     │
-│  • Runner scale set ID                              │
-│                                                     │
-│  DOES NOT CONTAIN:                                  │
-│  • NTSK GitHub PAT                                  │
-│  • NTSK GitHub App private key                      │
-│  • Any org-wide credentials                         │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
-
-**Security design**: The PAT/App token lives ONLY on the Controller. The runner pod gets a single-use, pre-scoped JIT token. If the pod is compromised, the attacker cannot register more runners or access your org-level credentials.
-
-### The generate-jitconfig API Call (Step ⑤)
-
-```
-POST /orgs/{org}/actions/runners/generate-jitconfig
-Authorization: Bearer <PAT or GitHub App installation token>
-
-{
-  "name": "arc-runner-set-rmrgw-runner-p9p5n",
-  "runner_group_id": 1,
-  "labels": ["self-hosted", "linux", "x64", "arc-runner-set"],
-  "work_folder": "_work"
-}
-
-Response 201:
-{
-  "runner": {
-    "id": 42,
-    "name": "arc-runner-set-rmrgw-runner-p9p5n",
-    "os": "linux",
-    "status": "offline",
-    "busy": false,
-    "ephemeral": true,
-    "labels": [...]
-  },
-  "encoded_jit_config": "eyJhbGciOi..."   ← this goes to the pod
-}
-```
-
-Note: The runner is already **registered** on GitHub at this point (status: "offline"). The pod just needs to connect using the token.
-
-### How JIT Config Reaches the Pod
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ EphemeralRunner Controller                                  │
-│                                                             │
-│  1. Calls GitHub API → gets encoded_jit_config              │
-│  2. Creates Pod spec:                                       │
-│                                                             │
-│     containers:                                             │
-│     - name: runner                                          │
-│       image: ghcr.io/actions/actions-runner:latest          │
-│       command: ["/home/runner/run.sh"]                      │
-│       args: ["--jitconfig", "eyJhbGciOi..."]                │
-│       ─── OR ───                                            │
-│       env:                                                  │
-│       - name: ACTIONS_RUNNER_INPUT_JITCONFIG                │
-│         value: "eyJhbGciOi..."                              │
-│                                                             │
-│  3. Pod scheduled → node pulls image → container starts     │
-│  4. run.sh reads --jitconfig, skips config.sh entirely      │
-│     (no interactive registration needed)                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Order of Operations: JIT Token FIRST, Then Pod Creation
-
-The JIT config token is obtained **before** the pod is created. This is required because the token is baked into the pod spec itself (as args/env). The pod cannot exist without it.
-
-```
-Timeline:
-─────────────────────────────────────────────────────────────────────────────
-
-  ④ EphemeralRunner     ⑤ Controller calls     ⑥ GitHub returns       ⑦ Controller
-     CR created            GitHub API:            response:              creates Pod
-     (name known:          generate-jitconfig     {                      with JIT config
-      "arc-runner-                                  runner: {             in args/env
-       set-abc123")        { name: "...",             id: 42,
-                             runner_group_id: 1,      status: "offline",
-                             labels: [...] }          ephemeral: true
-                                                    },
-                                                    encoded_jit_config:
-                                                      "eyJhbG..."
-                                                  }
-         │                      │                       │                    │
-─────────┼──────────────────────┼───────────────────────┼────────────────────┼─────
-         │                      │                       │                    │
-         ▼                      ▼                       ▼                    ▼
-   Runner name is         GitHub pre-registers     Runner exists on      Pod is created
-   decided by K8s         the runner (offline)     GitHub BEFORE the     AFTER we have
-   (from CR name)                                  pod even exists       the token
-```
-
-**Why this order?**
-- The `generate-jitconfig` API both **registers the runner** AND returns the token in one call
-- GitHub needs to know the runner name/labels/group upfront to allocate an ID
-- The pod spec needs the token at creation time — you can't inject it after the fact
-- If the pod later fails to start, the controller's finalizer deregisters the orphaned "offline" runner from GitHub
-
-### Why JIT Token Exists — The Security Problem It Solves
-
-The JIT token solves a **credential scoping problem**. Without it, you'd have to put your org-level PAT or GitHub App private key directly on the runner pod.
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  WITHOUT JIT (traditional / naive approach)                              │
-│                                                                          │
-│  Controller has: PAT (admin:org scope)                                   │
-│                     │                                                    │
-│                     │  "Here, pod, use this to register yourself"         │
-│                     ▼                                                    │
-│  ┌──────────────────────────────────────┐                                │
-│  │ Runner Pod                           │                                │
-│  │                                      │                                │
-│  │  Has: PAT (admin:org scope) 😱       │                                │
-│  │                                      │                                │
-│  │  If compromised, attacker can:       │                                │
-│  │   • Register unlimited new runners   │                                │
-│  │   • List all runners in the org      │                                │
-│  │   • Delete other runners             │                                │
-│  │   • Access org-level settings        │                                │
-│  │   • Potentially pivot to other repos │                                │
-│  └──────────────────────────────────────┘                                │
-└─────────────────────────────────────────────────────────────────────────┘
-
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│  WITH JIT                                                                │
-│                                                                          │
-│  Controller has: PAT (admin:org scope) — never leaves the controller     │
-│                     │                                                    │
-│                     │  Calls GitHub API: "pre-register runner X"          │
-│                     │  Gets back: single-use JIT token (scoped to X)     │
-│                     │                                                    │
-│                     │  "Here, pod, use this to CONNECT as runner X"       │
-│                     ▼                                                    │
-│  ┌──────────────────────────────────────┐                                │
-│  │ Runner Pod                           │                                │
-│  │                                      │                                │
-│  │  Has: JIT token (scoped, single-use) │                                │
-│  │                                      │                                │
-│  │  If compromised, attacker can:       │                                │
-│  │   • Connect as THIS runner only      │                                │
-│  │   • ...that's it                     │                                │
-│  │                                      │                                │
-│  │  Attacker CANNOT:                    │                                │
-│  │   • Register new runners             │                                │
-│  │   • See other runners                │                                │
-│  │   • Access org settings              │                                │
-│  │   • Reuse the token (it's one-shot)  │                                │
-│  └──────────────────────────────────────┘                                │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-**Hotel analogy:**
-
-| Concept | Hotel analogy |
-|---------|--------------|
-| PAT / GitHub App key | Master key card (opens every room) |
-| JIT token | Room-specific key card (opens only room 42, expires at checkout) |
-| Controller | Front desk (holds master, issues room keys) |
-| Runner Pod | Hotel guest (only gets their room key) |
-
-**Three design goals JIT achieves:**
-
-1. **Least privilege** — the pod only gets credentials to do one thing: connect as one pre-registered runner
-2. **No config step** — traditional `config.sh` creates a `.credentials` file with long-lived RSA keys; JIT skips all of that
-3. **Ephemeral by design** — token is meaningless after the pod connects; there's nothing to steal that's reusable
-
-**What would happen without JIT?**
-
-- **Put the PAT on every pod** → massive blast radius if any pod is compromised (supply-chain attack in a workflow step, malicious action, etc.)
-- **Use a registration token** → better, but it's reusable for 1 hour and anyone who intercepts it can register arbitrary runners into your org
-- **Mount a shared secret** → same problem, plus secret rotation becomes a nightmare at scale
-
-JIT eliminates all of these by making the controller the **single trust boundary** — the only component that ever touches your org credentials.
-
-### Traditional Registration vs. JIT Registration
-
-| Aspect | Traditional (config.sh) | JIT (ARC) |
-|--------|------------------------|-----------|
-| Registration token | 1-hour lived, reusable | N/A — runner pre-registered |
-| Config step | `./config.sh --url ... --token ...` | Skipped entirely |
-| Credentials on pod | `.credentials` file (RSA keys) | JIT token in args/env only |
-| Runner identity | Created during config.sh | Pre-created by Controller via API |
-| Reuse | Runner persists across jobs | One job, then destroyed |
-| Compromise blast radius | Can re-register, has long-lived creds | Token is single-use, scoped |
-
-### Why Is a Credential (JIT or Traditional) Required At All?
-
-The credential is NOT just for the initial "registration" step. It's the runner's **authenticated identity for EVERY API call throughout its entire lifetime**:
-
-```
-Runner Pod lifecycle — EVERY arrow is an authenticated HTTPS call:
-
-    ┌────────────────────────────────────────────────────────────┐
-    │  "Who are you? Prove it." ← GitHub asks this EVERY TIME    │
-    └────────────────────────────────────────────────────────────┘
-
-    Runner Pod                                     GitHub
-        │                                            │
-        │── "I'm runner 42" (credential) ───────────▶│ Connect & get job
-        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 1
-        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 2
-        │── "I'm runner 42" (credential) ───────────▶│ Mark step 1 done ✓
-        │── "I'm runner 42" (credential) ───────────▶│ Stream log line 3
-        │── "I'm runner 42" (credential) ───────────▶│ Upload artifact
-        │── "I'm runner 42" (credential) ───────────▶│ Mark step 2 done ✓
-        │── "I'm runner 42" (credential) ───────────▶│ Save cache
-        │── "I'm runner 42" (credential) ───────────▶│ Report job complete
-        │── "I'm runner 42" (credential) ───────────▶│ Deregister myself
-```
-
-**What the credential provides:**
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  1. IDENTITY    — Proves to GitHub "I am runner 42, not an        │
-│                   imposter"                                        │
-│                                                                    │
-│  2. AUTHORIZATION — GitHub checks "is runner 42 allowed to        │
-│                     receive job 789?" (was it assigned to this     │
-│                     scale set?)                                    │
-│                                                                    │
-│  3. SESSION     — Every subsequent API call (logs, status,        │
-│                   artifacts, completion) uses this as bearer token │
-│                                                                    │
-│  4. INTEGRITY   — GitHub can trust that logs/results came from    │
-│                   the real runner, not a man-in-the-middle         │
-└────────────────────────────────────────────────────────────────────┘
-
-Think of it as: an API key for the runner's ENTIRE conversation
-with GitHub, from "hello" to "goodbye"
-```
-
-**What happens without any credential?**
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  WITHOUT any credential on the pod:                           │
-│                                                               │
-│  • Pod can't open long-poll connection                        │
-│    (GitHub: "who are you? rejected.")                         │
-│                                                               │
-│  • Pod runs the job... but can't send logs to GitHub          │
-│    (GitHub: "who are you? rejected.")                         │
-│                                                               │
-│  • Pod finishes... but can't report success/failure           │
-│    (GitHub: "who are you? rejected.")                         │
-│                                                               │
-│  • Pod wants to upload artifacts... rejected.                 │
-│                                                               │
-│  • Job hangs forever as "In Progress" on GitHub UI            │
-│    because nobody authenticated is telling GitHub it's done   │
-│                                                               │
-│  Also:                                                        │
-│  • Any random machine could POST fake logs to GitHub          │
-│  • Anyone could claim "job succeeded" for your workflow       │
-│  • No way to verify that results came from YOUR runner        │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Why registration is needed (separate from the credential):**
-
-1. GitHub needs to **know the runner exists** before assigning it a job
-2. GitHub needs to **issue a scoped credential** so the runner can make authenticated calls
-3. GitHub needs to **track which runner is doing what** (UI, billing, audit logs)
-
-Without registration, GitHub has no way to distinguish your legitimate runner from a random machine on the internet claiming to be one.
-
-**Analogy — phone call with your bank:**
-
-| Step | Without auth | With auth |
-|------|-------------|-----------|
-| "Transfer $500" | Bank: "Who is this? No." | Bank: "Verified. Done." |
-| "What's my balance?" | Bank: "Prove who you are" | Bank: "$1200" |
-| "Close my account" | Bank: "Absolutely not" | Bank: "Confirmed" |
-
-The credential isn't just for "calling the bank" (connecting). It's needed for **every action during the call** (the entire session).
-
-### Failure Handling During Registration
-
-```
-                    ┌──────────────────┐
-                    │ EphemeralRunner  │
-                    │ Controller       │
-                    └────────┬─────────┘
-                             │
-                ┌────────────▼────────────┐
-                │ Create Runner Pod       │
-                └────────────┬────────────┘
-                             │
-                     ┌───────▼───────┐
-                     │ Pod status?   │
-                     └───────┬───────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-        ┌─────▼─────┐ ┌─────▼─────┐ ┌─────▼─────┐
-        │ Running   │ │ Failed    │ │ Pending   │
-        │ (success) │ │           │ │ (stuck)   │
-        └───────────┘ └─────┬─────┘ └─────┬─────┘
-                            │             │
-                      ┌─────▼─────┐       │
-                      │ Retry     │       │ After 24h, GitHub
-                      │ (up to 5x │       │ unassigns the job
-                      │  with     │       │
-                      │  backoff) │       │
-                      └─────┬─────┘       │
-                            │             │
-                     ┌──────▼──────┐      │
-                     │ Still fails │      │
-                     └──────┬──────┘      │
-                            │             │
-                     ┌──────▼─────────────▼──┐
-                     │ Mark EphemeralRunner  │
-                     │ as failed             │
-                     │ GitHub unassigns job  │
-                     │ (re-queued or failed) │
-                     └───────────────────────┘
-```
-
-Key failure behaviors:
-- **Pod creation fails**: Controller retries up to 5x with exponential backoff
-- **Resource quota exceeded**: Controller handles "status forbidden" and retries
-- **JIT token request fails**: Exponential backoff on token generation
-- **Runner never connects**: GitHub times out after 24 hours, unassigns the job
-- **Listener pod evicted**: Controller restarts it automatically
-- **Long-poll session expires**: Listener refreshes the session token
-
----
-
-## How GitHub Communicates with Pods (It Doesn't — Pods Call Out)
-
-### The Key Insight
-
-GitHub **never initiates** a connection to your pods. All communication is **outbound from your infrastructure**. The pod opens an HTTPS connection to GitHub and holds it open — GitHub responds on that same connection when there's something to say.
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│   COMMON MISCONCEPTION:                                                  │
-│                                                                          │
-│   GitHub ──────── pushes jobs to ──────────▶ Runner Pod     ✗ WRONG      │
-│                                                                          │
-│                                                                          │
-│   REALITY:                                                               │
-│                                                                          │
-│   Runner Pod ──── opens HTTPS connection ──▶ GitHub                      │
-│              ◀─── GitHub responds on the ─── (same connection)           │
-│                   ALREADY-OPEN connection                ✓ CORRECT       │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why? Pods Are Behind NAT/Firewalls
-
-```
-┌──────────────────────────────────────┐       ┌─────────────────────┐
-│  YOUR K8s CLUSTER                    │       │  GITHUB             │
-│                                      │       │                     │
-│  ┌────────────┐                      │       │  actions.github.com │
-│  │ Runner Pod │                      │       │                     │
-│  │ 10.0.5.23  │ ← private IP        │       │  Public IP          │
-│  └─────┬──────┘   (not routable     │       │                     │
-│        │            from internet)   │       │                     │
-│  ┌─────▼──────┐                      │       │                     │
-│  │ K8s Service│                      │       │                     │
-│  │ / NAT      │                      │       │                     │
-│  └─────┬──────┘                      │       │                     │
-│  ┌─────▼──────┐                      │       │                     │
-│  │ Firewall   │  Only OUTBOUND 443 ──┼──────▶│                     │
-│  │            │  allowed             │       │                     │
-│  └────────────┘                      │       │                     │
-│                                      │       │  GitHub has NO way  │
-│  No inbound ports open!              │       │  to initiate a      │
-│  GitHub can't reach 10.0.5.23        │       │  connection to you  │
-└──────────────────────────────────────┘       └─────────────────────┘
-```
-
-### The Mechanism: HTTPS Long-Polling
-
-```
-Runner Pod                                          GitHub Actions Service
-    │                                                        │
-    │  ① HTTPS GET /messages                                 │
-    │     "Hey GitHub, got anything for me?"                  │
-    │────────────────────────────────────────────────────────▶│
-    │                                                        │
-    │         ② GitHub holds the connection OPEN              │
-    │            (doesn't respond yet)                        │
-    │            ...                                          │
-    │            ... seconds pass ...                         │
-    │            ... maybe 30-60 seconds ...                  │
-    │                                                        │
-    │                                                        │  ← job arrives
-    │                                                        │
-    │  ③ GitHub responds ON THE SAME CONNECTION              │
-    │     {jobId: 123, payload: ...}                          │
-    │◀────────────────────────────────────────────────────────│
-    │                                                        │
-    │  ④ Runner processes job                                │
-    │                                                        │
-    │  ⑤ HTTPS POST /logs, /timeline, /complete              │
-    │     (normal request-response for each)                  │
-    │────────────────────────────────────────────────────────▶│
-    │                                                        │
-    │  ⑥ Back to step ①: open a NEW long-poll               │
-    │     (or connection times out → reconnect)              │
-    │────────────────────────────────────────────────────────▶│
-    │                                                        │
-```
-
-### What is Long-Polling vs. Naive Polling?
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  POLLING (naive, wasteful)                                       │
-│                                                                  │
-│  Client: "Any jobs?" → Server: "No"     (every 5 seconds)       │
-│  Client: "Any jobs?" → Server: "No"                             │
-│  Client: "Any jobs?" → Server: "No"                             │
-│  Client: "Any jobs?" → Server: "No"                             │
-│  Client: "Any jobs?" → Server: "Yes! Here's the job"            │
-│                                                                  │
-│  Problem: thousands of runners × every 5 seconds = API rate     │
-│           limits destroyed, massive GitHub server load            │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│  LONG-POLLING (what ARC uses)                                    │
-│                                                                  │
-│  Client: "Any jobs?" → Server: ...holds connection open...       │
-│                                  ...waits...                     │
-│                                  ...job arrives...               │
-│                         Server: "Yes! Here's the job"            │
-│                                                                  │
-│  ONE request, ONE response. No wasted round trips.               │
-│  Near-instant delivery (as fast as a push).                      │
-│  No API rate limit issues.                                       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### All Connections Are Outbound from Your Infra
-
-```
-YOUR K8s                                         GITHUB (public internet)
-────────                                         ────────────────────────
-
-Listener Pod ────── long-poll (HTTPS 443) ──────▶ Actions Service
-                    "waiting for job assignments"    (message broker)
-
-Runner Pod ──────── long-poll (HTTPS 443) ──────▶ Actions Service
-                    "waiting for my job payload"
-
-Runner Pod ──────── POST (HTTPS 443) ───────────▶ Actions Service
-                    "here are my logs"
-
-Runner Pod ──────── POST (HTTPS 443) ───────────▶ Actions Service
-                    "step 3 completed"
-
-Runner Pod ──────── PUT (HTTPS 443) ────────────▶ Artifact Service
-                    "uploading build artifacts"
-
-Runner Pod ──────── DELETE (HTTPS 443) ─────────▶ Registration Service
-                    "I'm done, deregister me"
-
-
-ALL arrows point →  (outbound from your infra)
-ZERO arrows point ← (nothing inbound)
-```
-
-### Why This Design?
-
-| Reason | Explanation |
-|--------|-------------|
-| **Firewall-friendly** | Only need outbound HTTPS (443). No inbound ports, no public IPs for runners |
-| **NAT-friendly** | Pods have private IPs (10.x, 172.x). GitHub couldn't reach them even if it wanted to |
-| **No webhook infra needed** | Webhooks require a public endpoint + TLS cert + ingress. Long-poll needs nothing |
-| **No rate limiting** | One long-lived connection vs. thousands of polling requests per minute |
-| **Scales to zero** | When no pods exist, no connections exist. GitHub just holds jobs in queue |
-| **Works behind corporate proxies** | Just a normal HTTPS request from the proxy's perspective |
-
-### Compare: Webhooks vs. Long-Poll
-
-```
-┌─────────────────────────────────────────┐  ┌────────────────────────────────────────┐
-│  WEBHOOK MODEL (NOT what ARC uses)      │  │  LONG-POLL MODEL (what ARC uses)       │
-│                                         │  │                                        │
-│  GitHub ──POST──▶ your-public-endpoint  │  │  Your pod ──GET──▶ GitHub              │
-│                                         │  │           ◀─response── (when ready)    │
-│  Requires:                              │  │                                        │
-│   • Public DNS name                     │  │  Requires:                             │
-│   • Ingress controller                  │  │   • Outbound HTTPS only                │
-│   • TLS certificate                     │  │   • Nothing else                       │
-│   • Open firewall port                  │  │                                        │
-│   • DDoS protection                     │  │                                        │
-└─────────────────────────────────────────┘  └────────────────────────────────────────┘
-```
-
-This is why ARC works in any environment — air-gapped networks (with a proxy), private clusters, behind NATs — as long as you have outbound HTTPS to `github.com` / `*.actions.githubusercontent.com`.
-
----
-
-## Summary: Every GitHub API Interaction
-
-| When | Who calls | GitHub API endpoint | Purpose |
-|------|-----------|-------------------|---------|
-| Setup (once) | Controller | Register scale set | Makes GitHub aware of NTSK pool |
-| Setup (once) | Listener | Acquire message session | Opens long-poll channel |
-| **Ongoing** | Listener | Long-poll messages | Receives job assignments |
-| Per job | Runner pod | Register runner (JIT) | "I exist, give me work" |
-| Per job | Runner pod | Get job payload | Fetches steps to execute |
-| During job | Runner pod | POST live logs | Streams output to UI |
-| During job | Runner pod | POST step timeline | Updates step status in UI |
-| During job | Runner pod | Artifacts/cache API | Upload artifacts, save/restore cache |
-| Job end | Runner pod | POST job complete | Reports success/failure |
-| Job end | Runner pod | DELETE runner | Deregisters itself |
-| Job end | Listener | ACK completion | Tells GitHub "I handled it" |
-
----
-
-## What GitHub Sees vs. What You Control
+### What GitHub Sees vs. What You Control
 
 | GitHub knows | You control |
 |---|---|
@@ -977,1840 +32,1353 @@ This is why ARC works in any environment — air-gapped networks (with a proxy),
 | Billable minutes (if applicable) | Secrets, volumes, network policy |
 | Runner OS/arch (reported by pod) | Which namespace, which cluster |
 
-**GitHub CANNOT** SSH into runners, see the cluster state, or access the volumes/secrets.
+GitHub CANNOT SSH into runners, see cluster state, or access volumes/secrets. You CANNOT control job assignment algorithm, modify GitHub's queue priority, or skip runner registration. GitHub treats your scale set as a **black box pool** — it assigns jobs to the pool; your infrastructure decides how to fulfill them.
 
-**You CANNOT** control job assignment algorithm, modify GitHub's queue priority, or skip runner registration.
+### Key Terminology
 
-The key insight: GitHub treats NTSK scale set as a **black box pool**. It assigns jobs to the pool; NTSK infrastructure decides how to fulfill them. The only contract between the two sides is the runner registration/deregistration API and the job lifecycle messages.
-
----
-
-## Listener Logging Configuration
-
-The listener pod (`ghalistener`) supports configurable log levels — it is **not** hardcoded to `info`.
-
-### How It Works
-
-1. The **controller's `--log-level` flag** (set in the Helm chart `gha-runner-scale-set-controller`) defaults to `debug`
-2. The controller propagates its log level to the listener pod's config JSON via `SetListenerLoggingParameters()`
-3. The listener reads `log_level` from its config file and creates a logger supporting: `debug`, `info`, `warn`, `error`
-
-### Configuring Log Level
-
-Set `flags.logLevel` in the controller's Helm values:
-
-```yaml
-# charts/gha-runner-scale-set-controller/values.yaml
-flags:
-  logLevel: "debug"   # valid: "debug", "info", "warn", "error"
-  logFormat: "text"   # valid: "text", "json"
-```
-
-### Code Path
-
-```
-Controller main.go
-  → flag.StringVar(&logLevel, "log-level", "debug", ...)
-  → SetListenerLoggingParameters(logLevel, logFormat)
-      → sets package-level vars: scaleSetListenerLogLevel, scaleSetListenerLogFormat
-      → these are written into the listener config JSON when the listener pod is created
-
-Listener cmd/ghalistener/main.go
-  → config.Read() parses JSON config (including log_level, log_format)
-  → config.Logger() calls logger.New(logLevel, logFormat)
-      → creates slog.Logger with the specified level
-```
-
-### No Image Rebuild Required
-
-Changing the log level does **not** require rebuilding the Docker image. The Helm values are just passed as command-line args to the existing container at deploy time:
-
-```yaml
-# charts/gha-runner-scale-set-controller/templates/deployment.yaml
-{{- with .Values.flags.logLevel }}
-- "--log-level={{ . }}"
-{{- end }}
-```
-
-The binary inside the image (`/manager`) already supports all log levels (`debug`, `info`, `warn`, `error`) — it's parsed via `flag.StringVar` at startup (`main.go:160`). You just need a `helm upgrade`:
-
-```bash
-helm upgrade <release-name> gha-runner-scale-set-controller \
-  --set flags.logLevel=debug
-```
-
-Or update your values file and run `helm upgrade -f values.yaml ...`. The controller pod will restart with the new arg, and subsequent listener pods it creates will inherit the new log level in their config JSON.
-
-### Key Files (actions-runner-controller repo)
-
-| File | Role |
-|------|------|
-| `charts/gha-runner-scale-set-controller/values.yaml` | Helm values with `flags.logLevel` |
-| `main.go:160` | Controller's `--log-level` flag definition |
-| `controllers/actions.github.com/constants.go:73` | Default: `debug` |
-| `controllers/actions.github.com/resourcebuilder.go:54` | `SetListenerLoggingParameters()` |
-| `cmd/ghalistener/config/config.go:42` | Listener config struct with `log_level` field |
-| `logger/logger.go` | `slog.Logger` factory supporting debug/info/warn/error |
-
-### Default Behavior
-
-The default log level for both the controller and listener is **`debug`** (not `info`). If you're seeing only info-level logs, something in your deployment is explicitly setting `--log-level=info` or the config JSON has `"log_level": "info"`.
+| Term | Meaning |
+|------|---------|
+| **Runner Scale Set** | A named, autoscaled pool of runners registered to a repo/org/enterprise |
+| **Listener** | A long-polling process that receives job notifications from GitHub |
+| **Scaler** | Component inside the listener that patches K8s resources to adjust replica count |
+| **JIT Config** | Just-In-Time token — single-use credential for a runner pod to connect to GitHub |
+| **EphemeralRunner** | A runner that executes exactly one job, then self-destructs |
 
 ---
 
-## ARC Controller Design — Deep Dive (Source Code Analysis)
+## 2. Foundational Concepts
 
-### The Single Image, Two Binaries
+### Kubernetes Operators (Brief)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          SINGLE DOCKER IMAGE                                    │
-│                    (ghcr.io/actions/gha-runner-scale-set-controller)             │
-│                                                                                 │
-│   Contains TWO binaries:                                                        │
-│                                                                                 │
-│   ┌─────────────────────────────┐    ┌─────────────────────────────┐            │
-│   │  /manager                   │    │  /ghalistener               │            │
-│   │  (Controller Manager)       │    │  (Listener)                 │            │
-│   │                             │    │                             │            │
-│   │  Runs as: controller pod    │    │  Runs as: listener pod      │            │
-│   │  Namespace: arc-system      │    │  Namespace: arc-system      │            │
-│   │                             │    │  (one per runner scale set) │            │
-│   └─────────────────────────────┘    └─────────────────────────────┘            │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+An Operator is a controller + CRD (Custom Resource Definition) + domain logic. It continuously watches custom resources and reconciles actual state toward desired state. Unlike a Deployment (which just keeps N pods alive), an Operator encodes application-specific knowledge: how to register/deregister with external services, handle graceful drain, scale based on external signals.
 
-### Runtime Layout
+ARC is an Operator: it watches `AutoscalingRunnerSet` CRDs and orchestrates the full lifecycle — registering with GitHub, polling for jobs, creating runner pods, and cleaning up.
+
+### The Communication Model: Outbound-Only Long-Polling
+
+**All communication is outbound from your infrastructure.** GitHub never initiates connections to your pods.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  YOUR K8s CLUSTER                                                               │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐            │
-│  │  arc-system namespace                                           │            │
-│  │                                                                 │            │
-│  │  ┌──────────────────────────────────────┐                       │            │
-│  │  │  Controller Manager Pod              │                       │            │
-│  │  │  (/manager binary)                   │                       │            │
-│  │  │                                      │                       │            │
-│  │  │  4 reconcile loops inside:           │                       │            │
-│  │  │   • AutoscalingRunnerSet controller  │                       │            │
-│  │  │   • AutoscalingListener controller   │                       │            │
-│  │  │   • EphemeralRunnerSet controller    │                       │            │
-│  │  │   • EphemeralRunner controller       │                       │            │
-│  │  └──────────────────────────────────────┘                       │            │
-│  │                                                                 │            │
-│  │  ┌──────────────────────────────────────┐                       │            │
-│  │  │  Listener Pod A (for scale-set-1)    │  ← one per scale set  │            │
-│  │  │  (/ghalistener binary)               │                       │            │
-│  │  └──────────────────────────────────────┘                       │            │
-│  │  ┌──────────────────────────────────────┐                       │            │
-│  │  │  Listener Pod B (for scale-set-2)    │                       │            │
-│  │  └──────────────────────────────────────┘                       │            │
-│  └─────────────────────────────────────────────────────────────────┘            │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐            │
-│  │  arc-runners namespace                                          │            │
-│  │                                                                 │            │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                      │            │
-│  │  │ Runner   │  │ Runner   │  │ Runner   │  ← ephemeral pods     │            │
-│  │  │ Pod 1    │  │ Pod 2    │  │ Pod 3    │                       │            │
-│  │  └──────────┘  └──────────┘  └──────────┘                      │            │
-│  └─────────────────────────────────────────────────────────────────┘            │
-└─────────────────────────────────────────────────────────────────────────────────┘
+COMMON MISCONCEPTION:
+  GitHub ── pushes jobs to ──> Runner Pod          WRONG
+
+REALITY:
+  Runner Pod ── opens HTTPS connection ──> GitHub
+             <── GitHub responds on the ── (same connection)   CORRECT
 ```
 
-### CRD Hierarchy (The Data Model)
+**Why?** Pods are behind NAT/firewalls with private IPs. GitHub can't reach them. No inbound ports, ingress, or webhooks needed — just outbound HTTPS (443).
+
+**Long-polling vs. naive polling:**
 
 ```
-AutoscalingRunnerSet   ← user creates (via Helm chart)
-│                         "I want 0-60 runners for org/repo"
-│
-├── EphemeralRunnerSet  ← controller creates
-│   │                      "The template for runner pods + current replica count"
-│   │
-│   ├── EphemeralRunner ← controller creates (one per job)
-│   │                      "State machine for a single runner lifecycle"
-│   ├── EphemeralRunner
-│   └── ...
-│
-└── AutoscalingListener ← controller creates (in arc-system namespace)
+POLLING (wasteful):
+  Client: "Any jobs?" -> Server: "No"    (every 5 seconds)
+  Client: "Any jobs?" -> Server: "No"
+  Client: "Any jobs?" -> Server: "Yes!"
+  Problem: thousands of runners x every 5 seconds = rate limits destroyed
+
+LONG-POLLING (what ARC uses):
+  Client: "Any jobs?" -> Server: ...holds connection open...
+                                  ...waits...
+                                  ...job arrives...
+                         Server: "Yes! Here's the job"
+  ONE request, ONE response. Near-instant delivery. No rate limit issues.
+```
+
+**Comparison with webhooks:**
+
+| | Webhooks | Long-Poll (ARC) |
+|---|---|---|
+| Direction | GitHub POSTs to you | You GET from GitHub |
+| Requires | Public DNS, ingress, TLS, open port | Outbound HTTPS only |
+| Works behind NAT | No | Yes |
+| Works in air-gapped (with proxy) | No | Yes |
+
+### CRD Hierarchy
+
+```
+AutoscalingRunnerSet   <-- user creates (via Helm chart)
+|                         "I want 0-60 runners for org/repo"
+|
++-- EphemeralRunnerSet  <-- controller creates
+|   |                      "Pod template + current replica count"
+|   |
+|   +-- EphemeralRunner <-- controller creates (one per job)
+|   |                      "State machine for a single runner lifecycle"
+|   +-- EphemeralRunner
+|   +-- ...
+|
++-- AutoscalingListener <-- controller creates (in controller namespace)
                            "Config for the listener pod"
 ```
 
-**Key fields for each CRD:**
-
 | CRD | Key Spec Fields | Key Status Fields |
 |-----|----------------|------------------|
-| `AutoscalingRunnerSet` | `githubConfigUrl`, `minRunners`, `maxRunners`, `template` (pod spec) | `phase` (Pending/Running/Outdated), `currentRunners` |
+| `AutoscalingRunnerSet` | `githubConfigUrl`, `minRunners`, `maxRunners`, `template` (pod spec) | `phase`, `currentRunners` |
 | `EphemeralRunnerSet` | `replicas` (set by listener), `patchID`, `ephemeralRunnerSpec` | `currentReplicas`, `pendingEphemeralRunners`, `runningEphemeralRunners` |
-| `EphemeralRunner` | `githubConfigUrl`, `runnerScaleSetId`, pod template | `phase` (Pending/Running/Succeeded/Failed), `runnerId`, `jobId` |
-| `AutoscalingListener` | `runnerScaleSetId`, `maxRunners`, `minRunners`, `image` | (empty — it's just a pod spec holder) |
+| `EphemeralRunner` | `githubConfigUrl`, `runnerScaleSetId`, pod template | `phase`, `runnerId`, `jobId`, `failures` |
+| `AutoscalingListener` | `runnerScaleSetId`, `maxRunners`, `minRunners`, `image` | (pod spec holder only) |
 
 ### RunnerScaleSet vs AutoscalingRunnerSet vs EphemeralRunnerSet
 
-These three things live in **different systems**:
-
 | | RunnerScaleSet | AutoscalingRunnerSet | EphemeralRunnerSet |
 |---|---|---|---|
-| **Where it lives** | GitHub's Actions Service (their database) | K8s API (your cluster) | K8s API (your cluster) |
-| **Who creates it** | Controller calls GitHub API | You (via Helm chart) | Controller (automatically) |
-| **What it represents** | "GitHub knows this pool exists" | "I want runners with these settings" | "Here's the pod template + current desired count" |
-| **Who reads it** | GitHub (to assign jobs to your pool) | AutoscalingRunnerSet controller | EphemeralRunnerSet controller + Listener |
-| **Who writes to it** | Controller (register/update/delete) | You (Helm upgrade) | Listener (patches `replicas`) |
+| **Where** | GitHub's Actions Service (their DB) | K8s API (your cluster) | K8s API (your cluster) |
+| **Created by** | Controller calls GitHub API | You (via Helm chart) | Controller (automatically) |
+| **Represents** | "GitHub knows this pool exists" | "I want runners with these settings" | "Pod template + current desired count" |
+| **Read by** | GitHub (to assign jobs) | AutoscalingRunnerSet controller | EphemeralRunnerSet controller + Listener |
+| **Written by** | Controller (register/update/delete) | You (Helm upgrade) | Listener (patches `replicas` + `patchID`) |
 
-**Why EphemeralRunnerSet exists separately:** The Listener writes `replicas` and your Helm upgrades write `template`. If both wrote to the same object, they'd conflict. EphemeralRunnerSet is the buffer:
+### Scale Set vs. Runner Group
 
-```
-Listener writes:  EphemeralRunnerSet.spec.replicas = 5
-                  EphemeralRunnerSet.spec.patchID = 42
+- A **runner group** (GitHub concept) is an access-control boundary — "which repos can use these runners"
+- A **scale set** (ARC/K8s concept) is a deployment unit — "a pool of pods with specific resources, scaling rules, and container mode"
 
-Controller reads: "replicas is 5, I have 3 EphemeralRunners → create 2 more"
-
-You (Helm):      Modify AutoscalingRunnerSet.spec.template (change runner image)
-                  Controller creates NEW EphemeralRunnerSet, deletes old one
-                  Listener patching is never disrupted
-```
-
-### The Four Controllers (Inside /manager)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  CONTROLLER MANAGER (/manager binary)                                               │
-│                                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
-│  │  1. AutoscalingRunnerSet Controller                                         │    │
-│  │     Watches: AutoscalingRunnerSet                                           │    │
-│  │     Creates: EphemeralRunnerSet, AutoscalingListener                        │    │
-│  │     Talks to: GitHub API (register/update/delete scale set)                 │    │
-│  │                                                                             │    │
-│  │     Responsibilities:                                                       │    │
-│  │      • Register scale set with GitHub Actions Service                       │    │
-│  │      • Create/update EphemeralRunnerSet when spec changes                   │    │
-│  │      • Create/delete AutoscalingListener resource                           │    │
-│  │      • Handle update strategy (immediate vs eventual)                       │    │
-│  │      • Clean up old EphemeralRunnerSets after rolling update                │    │
-│  └─────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
-│  │  2. AutoscalingListener Controller                                          │    │
-│  │     Watches: AutoscalingListener                                            │    │
-│  │     Creates: Pod, ServiceAccount, Role, RoleBinding, Secret (config JSON)   │    │
-│  │                                                                             │    │
-│  │     Responsibilities:                                                       │    │
-│  │      • Create the listener pod (from the same image, /ghalistener binary)   │    │
-│  │      • Set up RBAC so listener can patch EphemeralRunnerSet                 │    │
-│  │      • Generate config JSON secret with credentials + settings              │    │
-│  │      • Recreate listener pod if it crashes or config changes                │    │
-│  └─────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
-│  │  3. EphemeralRunnerSet Controller                                           │    │
-│  │     Watches: EphemeralRunnerSet, EphemeralRunner                            │    │
-│  │     Creates: EphemeralRunner                                                │    │
-│  │                                                                             │    │
-│  │     Responsibilities:                                                       │    │
-│  │      • Ensure count of EphemeralRunners matches spec.replicas               │    │
-│  │      • Create new EphemeralRunners on scale-up                              │    │
-│  │      • Clean up finished/failed EphemeralRunners                            │    │
-│  │      • Update status counts (pending, running, failed)                      │    │
-│  └─────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐    │
-│  │  4. EphemeralRunner Controller                                              │    │
-│  │     Watches: EphemeralRunner, Pod                                           │    │
-│  │     Creates: Pod (the actual runner), Secret (JIT config)                   │    │
-│  │     Talks to: GitHub API (generate JIT config, remove runner)               │    │
-│  │                                                                             │    │
-│  │     Responsibilities:                                                       │    │
-│  │      • Request JIT config token from GitHub                                 │    │
-│  │      • Create the runner pod with JIT config injected                       │    │
-│  │      • Track pod lifecycle → update EphemeralRunner phase                   │    │
-│  │      • Retry pod creation on failure (up to 5x with backoff)                │    │
-│  │      • Deregister runner from GitHub on cleanup (finalizer)                 │    │
-│  └─────────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### The Listener Process (/ghalistener)
-
-The listener runs as a separate pod (one per scale set). It has three components:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│  LISTENER POD (/ghalistener binary)                                                 │
-│                                                                                     │
-│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
-│  │  scaleset.MessageSessionClient (from github.com/actions/scaleset library)     │  │
-│  │                                                                               │  │
-│  │  • Authenticates with GitHub (PAT or GitHub App)                              │  │
-│  │  • Manages message session (create/refresh/delete)                            │  │
-│  │  • Long-polls for messages from Actions Service                               │  │
-│  └───────────────────────────────────────────────────────────────────────────────┘  │
-│                           │                                                         │
-│                           │ messages                                                │
-│                           ▼                                                         │
-│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
-│  │  listener.Listener (from github.com/actions/scaleset/listener package)        │  │
-│  │                                                                               │  │
-│  │  Main loop:                                                                   │  │
-│  │    1. GetMessage(lastMessageID, maxCapacity)  ← long-poll                     │  │
-│  │    2. DeleteMessage(messageID)                ← ACK                           │  │
-│  │    3. AcquireJobs(requestIDs)                 ← claim jobs                    │  │
-│  │    4. Call Scaler methods based on message type                               │  │
-│  │                                                                               │  │
-│  │  Message types handled:                                                       │  │
-│  │    • JobAvailable  → acquireJobs()                                            │  │
-│  │    • JobStarted    → scaler.HandleJobStarted()                                │  │
-│  │    • JobCompleted  → scaler.HandleJobCompleted()                              │  │
-│  │    • Statistics    → scaler.HandleDesiredRunnerCount()                         │  │
-│  └───────────────────────────────────────────────────────────────────────────────┘  │
-│                           │                                                         │
-│                           │ scale decisions                                         │
-│                           ▼                                                         │
-│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
-│  │  scaler.Scaler (cmd/ghalistener/scaler/scaler.go)                             │  │
-│  │                                                                               │  │
-│  │  • Calculates: targetRunners = min(minRunners + assignedJobs, maxRunners)     │  │
-│  │  • PATCHes EphemeralRunnerSet.spec.replicas via K8s API                       │  │
-│  │  • PATCHes EphemeralRunner.status with job info on JobStarted                 │  │
-│  └───────────────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### End-to-End Scaling Data Flow
-
-```
-  GITHUB                           LISTENER POD              K8s CONTROLLERS
-  ──────                           ────────────              ──────────────
-
-  Job queued for
-  "my-runners" label
-       │
-       │  ① Message on long-poll
-       │     {JobAvailable, stats}
-       ▼
-                                   ② Listener receives
-                                      message
-                                        │
-                                   ③ AcquireJobs(ids)
-       ◄────────────────────────────────│
-       ────────────────────────────────►│
-                                        │
-                                   ④ ACK (DeleteMessage)
-       ◄────────────────────────────────│
-                                        │
-                                   ⑤ Calculate desired:
-                                      min(minRunners +
-                                          assignedJobs,
-                                          maxRunners)
-                                        │
-                                   ⑥ PATCH EphemeralRunnerSet
-                                      spec.replicas = desired ───────────────────►
-
-                                                             ⑦ EphemeralRunnerSet ctrl
-                                                                sees replicas > actual
-                                                                creates EphemeralRunner
-                                                                         │
-                                                             ⑧ EphemeralRunner ctrl
-                                                                calls GitHub API:
-       ◄────────────────────────────────────────────────────── generateJITconfig
-       ──────────────────────────────────────────────────────►  {encoded_jit}
-                                                                         │
-                                                             ⑨ Creates runner Pod
-                                                                with JIT config
-                                                                         │
-                                                                         ▼
-                                                               ┌───────────────┐
-       ◄───────────────────────────────────────────────────────│  Runner Pod   │
-  ⑩ Runner registers,                                         │  executes job │
-     executes job,                                             └───────────────┘
-     reports complete                                                    │
-
-  ⑪ JobCompleted message                                                 │
-       │                                                                 │
-       ▼                                                                 │
-                                   ⑫ Listener receives                   │
-                                      JobCompleted                       │
-                                        │                                │
-                                   ⑬ Recalculates desired                │
-                                      PATCHes replicas ─────────────────►│
-
-                                                             ⑭ Pod terminates
-                                                                EphemeralRunner → Done
-                                                                Runner deregistered
-                                                                Pod + secrets cleaned
-```
-
-### Controller Reconcile Logic (Simplified Decision Trees)
-
-#### AutoscalingRunnerSet Controller
-
-```
-Reconcile(AutoscalingRunnerSet)
-│
-├── Being deleted?
-│   └── YES → clean up listener → clean up EphemeralRunnerSets
-│             → delete scale set from GitHub → remove finalizer
-│
-├── Has scale set ID annotation?
-│   └── NO → call GitHub API: register scale set → store ID in annotation
-│
-├── Runner group or name changed?
-│   └── YES → call GitHub API: update scale set
-│
-├── EphemeralRunnerSet exists?
-│   └── NO → create one (with current spec hash)
-│
-├── Latest EphemeralRunnerSet spec hash matches current?
-│   └── NO → (update strategy)
-│       ├── IMMEDIATE → create new EphemeralRunnerSet, old ones get cleaned up
-│       └── EVENTUAL → wait for running jobs to finish, then create new one
-│
-├── Listener exists?
-│   └── NO → create AutoscalingListener resource
-│
-├── Listener out of date?
-│   └── YES → delete it (will be recreated next reconcile)
-│
-└── All good → update status to "Running"
-```
-
-#### EphemeralRunnerSet Controller
-
-```
-Reconcile(EphemeralRunnerSet)
-│
-├── Being deleted?
-│   └── YES → delete all EphemeralRunners → remove finalizer
-│
-├── List all owned EphemeralRunners, group by state:
-│   (pending, running, finished, failed, outdated, deleting)
-│
-├── Calculate total = pending + running (scale-relevant count)
-│
-├── total < spec.replicas?
-│   └── YES → create (spec.replicas - total) new EphemeralRunners
-│
-├── total > spec.replicas? (and patchID == 0, meaning draining)
-│   └── YES → delete excess runners (finished first, then pending)
-│
-└── Clean up finished EphemeralRunners (delete completed ones)
-```
-
-#### EphemeralRunner Controller
-
-```
-Reconcile(EphemeralRunner)
-│
-├── Being deleted?
-│   └── YES → deregister runner from GitHub API → delete pod → remove finalizer
-│
-├── Already done (Succeeded/Failed)?
-│   └── YES → do nothing
-│
-├── Pod exists?
-│   ├── NO → request JIT config from GitHub → create Pod
-│   │         (retry up to 5x with backoff: 5s, 10s, 20s, 40s, 80s)
-│   │
-│   └── YES → inspect pod phase:
-│       ├── Running → set EphemeralRunner phase = Running
-│       ├── Succeeded → set phase = Succeeded
-│       └── Failed → increment failure count
-│                    ├── failures > 5 → set phase = Failed (terminal)
-│                    └── failures ≤ 5 → delete pod, requeue (retry)
-```
-
-### Source Code Map
-
-```
-actions-runner-controller/
-│
-├── main.go                                    ← Controller manager entrypoint
-│                                                 Parses flags, sets up all 4 controllers
-│
-├── Dockerfile                                 ← Builds both /manager and /ghalistener
-│
-├── apis/actions.github.com/v1alpha1/          ← CRD type definitions
-│   ├── autoscalingrunnerset_types.go          ← AutoscalingRunnerSet spec/status
-│   ├── ephemeralrunnerset_types.go            ← EphemeralRunnerSet spec/status
-│   ├── ephemeralrunner_types.go               ← EphemeralRunner spec/status/phases
-│   └── autoscalinglistener_types.go           ← AutoscalingListener spec
-│
-├── controllers/actions.github.com/            ← Controller reconcile logic
-│   ├── autoscalingrunnerset_controller.go     ← Top-level orchestrator
-│   ├── autoscalinglistener_controller.go      ← Creates listener pod + RBAC
-│   ├── ephemeralrunnerset_controller.go       ← Manages count of EphemeralRunners
-│   ├── ephemeralrunner_controller.go          ← Manages individual runner lifecycle
-│   ├── resourcebuilder.go                     ← Builds K8s objects (pods, secrets, roles)
-│   ├── constants.go                           ← Defaults (log level, label keys)
-│   └── secretresolver/                        ← Resolves GitHub credentials from secrets
-│
-├── cmd/ghalistener/                           ← Listener binary
-│   ├── main.go                                ← Listener entrypoint
-│   ├── config/config.go                       ← Reads JSON config from secret mount
-│   ├── scaler/scaler.go                       ← Patches K8s EphemeralRunnerSet
-│   └── metrics/metrics.go                     ← Prometheus metrics exporter
-│
-├── github.com/actions/scaleset (dependency)   ← GitHub API client library
-│   ├── client.go                              ← Scale set CRUD, JIT config generation
-│   ├── session_client.go                      ← Message session (long-poll)
-│   └── listener/listener.go                   ← Message loop + Scaler interface
-│
-├── logger/logger.go                           ← slog logger factory (debug/info/warn/error)
-├── logging/                                   ← logr-based logger for controller-runtime
-│
-└── charts/
-    ├── gha-runner-scale-set-controller/       ← Helm chart: deploys /manager
-    └── gha-runner-scale-set/                  ← Helm chart: creates AutoscalingRunnerSet CR
-```
-
-### Key Design Decisions
-
-| Decision | Why |
-|----------|-----|
-| **One image, two binaries** | Simplifies image management. `/manager` is the entrypoint; `/ghalistener` is the listener entrypoint |
-| **Listener is a separate pod** | Isolates the long-poll connection from the controller. If listener crashes, controller still runs (and recreates it) |
-| **One listener per scale set** | Each scale set has its own message session with GitHub. Can't multiplex |
-| **EphemeralRunnerSet as intermediary** | Decouples "desired replica count" (set by listener) from "runner lifecycle" (managed by controller). Prevents patch conflicts |
-| **PatchID on EphemeralRunnerSet** | Deduplication mechanism. Listener increments patchID on each patch. Controller only acts on new patches, avoiding re-processing |
-| **Finalizers everywhere** | Ensures cleanup happens before K8s garbage collection. Runner gets deregistered from GitHub before pod is deleted |
-| **Spec hash annotations** | Detect when user changes the AutoscalingRunnerSet spec. Triggers rolling update of EphemeralRunnerSet and Listener |
-| **Update strategies** | `immediate` = recreate everything now (may overprovision). `eventual` = wait for running jobs to drain first |
-
-### External Dependency: github.com/actions/scaleset v0.3.0
-
-The upstream `scaleset` library handles all GitHub API communication. Key points:
-
-- Uses `hashicorp/go-retryablehttp` for automatic retries (4 retries, 30s max wait)
-- Logger passed via `WithLogger(slog.Logger)` — used by retryablehttp for retry messages
-- The library does **NOT** log request/response bodies or headers at any level
-- Stack traces in error messages require source modifications (the custom image from Jan 2026 incident had these patches)
+Multiple scale sets can share one runner group (e.g., `linux-small` with 2 CPU, `linux-gpu` with GPU).
 
 ---
 
-## Deep Dive: Listener ↔ Scaler ↔ K8s Interaction (Scaling Decisions)
+## 3. Deployment Architecture
 
-This section traces the full data path from a GitHub message arriving at the listener through to pods being created or deleted in the cluster.
+### Two Helm Charts
 
-### Architecture Overview
+ARC is deployed via two separate Helm charts:
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│  GitHub Actions Service                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Message Queue (per scale set)                                       │  │
-│  │  - JobAvailable, JobStarted, JobCompleted messages                  │  │
-│  │  - Statistics snapshot on every response                            │  │
-│  └──────────┬──────────────────────────────────▲──────────────────────┘  │
-│             │ long-poll GET                     │ AcquireJobs POST        │
-│             │ (blocks until msg or timeout)     │                         │
-└─────────────┼──────────────────────────────────┼─────────────────────────┘
-              │                                  │
-              ▼                                  │
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Listener Pod (ghalistener binary)                                       │
-│  ┌────────────────┐     ┌──────────────────┐     ┌──────────────────┐   │
-│  │ scaleset lib   │────▶│ listener.Run()   │────▶│    Scaler        │   │
-│  │ SessionClient  │     │ message loop     │     │  (K8s patches)   │   │
-│  └────────────────┘     └──────────────────┘     └────────┬─────────┘   │
-└───────────────────────────────────────────────────────────┼─────────────┘
-                                                            │
-                                                            │ PATCH (merge-patch)
-                                                            ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  K8s API Server                                                          │
-│  ┌─────────────────────────────────┐    ┌──────────────────────────────┐ │
-│  │ EphemeralRunnerSet              │    │ EphemeralRunner              │ │
-│  │  spec.replicas = N              │    │  status.jobRequestID = X    │ │
-│  │  spec.patchID  = seq            │    │  status.jobID = Y           │ │
-│  └──────────────┬──────────────────┘    └──────────────────────────────┘ │
-│                 │ triggers reconcile                                      │
-│                 ▼                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │  EphemeralRunnerSet Controller (in /manager)                      │    │
-│  │  - Compares current runners vs spec.replicas                      │    │
-│  │  - Creates/deletes EphemeralRunner CRs                            │    │
-│  └──────────────┬───────────────────────────────────────────────────┘    │
-│                 │ triggers reconcile                                      │
-│                 ▼                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐    │
-│  │  EphemeralRunner Controller (in /manager)                         │    │
-│  │  - Requests JIT token from GitHub                                 │    │
-│  │  - Creates runner Pod                                             │    │
-│  └──────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### The Message Loop (listener.Run)
-
-The listener runs a single-goroutine loop that long-polls the GitHub message queue:
+| Chart | Install frequency | What it deploys |
+|-------|-------------------|----------------|
+| `gha-runner-scale-set-controller` | Once per cluster | Controller manager pod (the operator) |
+| `gha-runner-scale-set` | Once per runner pool | AutoscalingRunnerSet CR (triggers the operator) |
 
 ```
-listener.Run(ctx, scaler):
-  1. Read initial session statistics (TotalAssignedJobs)
-  2. Call scaler.HandleDesiredRunnerCount(initialAssignedJobs)
-  3. Loop forever:
-     a. GetMessage(lastMessageID, maxRunners)     ← blocks (long-poll)
-     b. If nil message (timeout/no work):
-        - Call scaler.HandleDesiredRunnerCount(latestStatistics.TotalAssignedJobs)
-        - Continue loop
-     c. If message received:
-        - Update lastMessageID
-        - handleMessage(scaler, msg)
+helm install arc-controller \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+
+helm install my-runners \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  --set githubConfigUrl="https://github.com/org" \
+  --set githubConfigSecret="github-secret" \
+  --set maxRunners=10
 ```
 
-The `handleMessage` sequence:
+The controller chart deploys the operator binary. The runner-set chart creates a CR that the operator watches. This separation means you can have many runner pools (different images, scaling bounds, labels) managed by a single controller.
+
+### Single Image, Two Binaries
 
 ```
-handleMessage(scaler, msg):
-  1. Store msg.Statistics as latestStatistics
-  2. DeleteMessage(msg.MessageID)                  ← ACK the message
-  3. If msg has JobAvailable messages:
-     - AcquireJobs(requestIDs)                    ← claim jobs from GitHub
-  4. For each JobStarted:
-     - scaler.HandleJobStarted(jobInfo)           ← patch EphemeralRunner status
-  5. For each JobCompleted:
-     - scaler.HandleJobCompleted(jobInfo)         ← sets dirty=true
-  6. scaler.HandleDesiredRunnerCount(msg.Statistics.TotalAssignedJobs)
++-------------------------------------------------------------------------+
+|                     SINGLE DOCKER IMAGE                                  |
+|           (ghcr.io/actions/gha-runner-scale-set-controller)             |
+|                                                                          |
+|   /manager                           /ghalistener                        |
+|   (Controller Manager)               (Listener)                          |
+|   Runs as: controller pod            Runs as: listener pod               |
+|   One per cluster                    One per scale set                   |
+|   Contains 4 reconcile controllers   Contains message loop + scaler     |
++-------------------------------------------------------------------------+
 ```
 
-Key insight: `HandleDesiredRunnerCount` is called on **every** iteration — even nil messages (timeouts). This ensures the system converges even if GitHub's statistics drift.
-
-### The Scaler: Computing Desired Runners
-
-The scaler (cmd/ghalistener/scaler/scaler.go) implements three methods:
-
-#### Formula
-
-```
-targetRunners = min(minRunners + assignedJobs, maxRunners)
+Built from a single Dockerfile:
+```dockerfile
+# Dockerfile (simplified)
+RUN go build -o /out/manager main.go
+RUN go build -o /out/ghalistener ./cmd/ghalistener
+ENTRYPOINT ["/manager"]
 ```
 
-- `assignedJobs` = `msg.Statistics.TotalAssignedJobs` (jobs assigned to this scale set, whether running or queued)
-- `minRunners` = configured minimum (ensures idle capacity)
-- `maxRunners` = configured maximum (cost cap)
-
-Example: minRunners=2, maxRunners=10, assignedJobs=5 → target = min(2+5, 10) = 7
-
-#### PatchID Deduplication Mechanism
-
-The scaler maintains a monotonically-increasing `patchSeq` counter:
-
-```go
-// scaler.setDesiredWorkerState(count):
-w.patchSeq++                                           // always increment
-targetRunnerCount := min(w.config.MinRunners + count, w.config.MaxRunners)
-
-desiredPatchID := w.patchSeq
-if !dirty && targetRunnerCount == oldTargetRunners && targetRunnerCount == w.config.MinRunners {
-    desiredPatchID = 0    // "no-op" signal — forces state without triggering scale
-}
-```
-
-Two modes:
-- **patchID > 0**: Normal patch. The EphemeralRunnerSet controller reacts to new patches.
-- **patchID == 0**: "Force state" patch. Used when nothing changed and we're at minRunners. Triggers a different code path in the controller (allows scale-down of stale runners).
-
-The `dirty` flag is set by `HandleJobStarted` and `HandleJobCompleted`. It forces a non-zero patchID even if the target count hasn't changed, ensuring the controller processes the event.
-
-#### The K8s Patch
-
-The scaler issues a **merge patch** to `EphemeralRunnerSet.spec`:
-
-```json
-{"spec": {"replicas": 7, "patchID": 42}}
-```
-
-This is done via raw REST client (`kubernetes.Clientset.RESTClient().Patch()`), not controller-runtime, because the listener pod runs outside the controller manager.
-
-### EphemeralRunnerSet Controller: Receiving the Patch
-
-When the `spec.replicas` or `spec.patchID` changes, the EphemeralRunnerSet controller reconciles:
+### Runtime Layout (Namespaces)
 
 ```
-Reconcile(ephemeralRunnerSet):
-  1. List all EphemeralRunners owned by this set
-  2. Classify by state: pending, running, finished, failed, deleting, outdated
-  3. Compute scaleTotal = pending + running + failed
-  4. Track latestPatchID = max patchID annotation across all EphemeralRunners
-
-  5. If spec.PatchID == 0 OR spec.PatchID != latestPatchID:
-     // This is a NEW patch we haven't acted on yet
-     
-     a. Cleanup finished runners (delete them)
-     
-     b. If scaleTotal < spec.Replicas:
-        → SCALE UP: create (spec.Replicas - scaleTotal) new EphemeralRunners
-        
-     c. If spec.PatchID > 0 AND scaleTotal >= spec.Replicas:
-        → DEFER SCALE DOWN: do nothing now (jobs may still be running)
-        
-     d. If spec.PatchID == 0 AND scaleTotal > spec.Replicas:
-        → SCALE DOWN: delete (scaleTotal - spec.Replicas) idle runners
-
-  6. Update status (currentReplicas, phase, counts)
++-------------------------------------------------------------------------+
+|  YOUR K8s CLUSTER                                                        |
+|                                                                          |
+|  +--------------------------------------------------------------+       |
+|  |  Controller Namespace (e.g., "arc-systems")                   |       |
+|  |                                                               |       |
+|  |  [Controller Manager Pod]    [Listener Pod A]   [Listener B]  |       |
+|  |   /manager binary             /ghalistener       /ghalistener  |       |
+|  |   4 reconcile loops           for scale-set-1    for set-2     |       |
+|  |                                                               |       |
+|  |  [ServiceAccount A] [Config Secret A] [Role/RoleBinding...]   |       |
+|  +--------------------------------------------------------------+       |
+|                                                                          |
+|  +--------------------------------------------------------------+       |
+|  |  Runner Namespace (e.g., "arc-runners")                       |       |
+|  |                                                               |       |
+|  |  [AutoscalingRunnerSet]  [EphemeralRunnerSet]                 |       |
+|  |  [EphemeralRunner 1]     [EphemeralRunner 2]                  |       |
+|  |  [Runner Pod 1]          [Runner Pod 2]    [JIT Secrets...]   |       |
+|  +--------------------------------------------------------------+       |
++-------------------------------------------------------------------------+
 ```
 
-#### PatchID as Idempotency Guard
+The controller and listener pods run in one namespace; runner CRs and pods run in another. This separation enables:
+- Tighter RBAC (runners can't see controller secrets)
+- Multiple runner namespaces managed by one controller
+- Independent lifecycle management
 
-Each EphemeralRunner gets an annotation `actions.github.com/patch-id` = the patchID at creation time.
+### Container Modes
 
-The controller compares:
-- `spec.PatchID` (what the listener wants)
-- `latestPatchID` (max annotation among existing runners)
+The `containerMode` setting controls how workflow steps execute inside the runner pod:
 
-If they match, the controller considers this patch already handled and skips scaling. This prevents double-scaling when a reconcile is triggered by unrelated events (e.g., runner status updates).
+| Mode | How it works | Use case |
+|------|-------------|----------|
+| **none** (default) | Steps run as processes inside the runner container | Simple jobs, no Docker needed |
+| **dind** (Docker-in-Docker) | A sidecar Docker daemon container; steps can `docker build/run` | Jobs that build/push Docker images |
+| **kubernetes** | Steps run as separate K8s pods via container hooks | Full pod isolation per step, custom resource limits per step |
 
-#### Scale-Down Safety
+With `dind`, the runner pod gets a privileged sidecar running dockerd. With `kubernetes`, the runner uses `ACTIONS_RUNNER_CONTAINER_HOOKS` to create K8s pods for each workflow step (linked via `runner-pod: <name>` labels, cleaned up by the EphemeralRunner controller).
 
-Scale-down is deliberately cautious:
-1. Only runners that are **registered** with GitHub (have `Status.RunnerID > 0`) are candidates
-2. Runners with an active job (`HasJob()`) are skipped
-3. Before K8s deletion, the runner is first removed from GitHub via `RemoveRunner(runnerID)`
-4. If GitHub returns `JobStillRunningError`, that runner is skipped
-5. Scale-down iterates oldest-first (sorted by creation timestamp)
-6. Pending runners come before running runners in the deletion order
-
-### HandleJobStarted: Runner Status Enrichment
-
-When a job starts, the listener patches the **individual EphemeralRunner's status**:
-
-```go
-scaler.HandleJobStarted(jobInfo):
-  1. Build merge patch with job metadata:
-     - status.jobRequestID
-     - status.jobRepositoryName  ("owner/repo")
-     - status.jobID
-     - status.workflowRunID
-     - status.jobWorkflowRef
-     - status.jobDisplayName
-  2. PATCH EphemeralRunners/<runnerName>/status
-  3. If not found → skip (runner already cleaned up)
-```
-
-This enrichment serves two purposes:
-- The EphemeralRunnerSet controller uses `HasJob()` to protect busy runners from scale-down
-- Observability: operators can see which runner is doing what via `kubectl get ephemeralrunners`
-
-### MaxCapacity: The Backpressure Signal
-
-The listener sends `X-ScaleSetMaxCapacity` header on every GetMessage request:
-
-```go
-req.Header.Set("X-ScaleSetMaxCapacity", strconv.Itoa(maxCapacity))
-```
-
-This tells GitHub: "I can handle up to N runners right now." GitHub uses this to:
-- Limit how many `JobAvailable` messages it sends in a batch
-- Avoid assigning more jobs to this scale set than it can handle
-
-The value comes from `listener.maxRunners` (an `atomic.Uint32`) which is set from `config.MaxRunners`. It can be dynamically updated via `listener.SetMaxRunners()`, though ARC doesn't use this dynamic path today.
-
-### AcquireJobs: Claiming Work
-
-When the message contains `JobAvailable` messages, the listener must explicitly claim them:
+### Configuration Flow
 
 ```
-acquireAvailableJobs(jobsAvailable):
-  1. Extract all RunnerRequestIDs from JobAvailable messages
-  2. POST /<scalesets>/<id>/acquirejobs with the request IDs
-  3. GitHub returns which IDs were actually acquired (others may have been claimed by another listener)
+Helm values.yaml
+  --> Controller Deployment args (--log-level, --update-strategy, ...)
+  --> AutoscalingRunnerSet CR (githubConfigUrl, min/maxRunners, template)
+  --> AutoscalingListener CR (derived from ARS)
+  --> Listener Config Secret (JSON with all params)
+  --> Listener Pod (reads /etc/gha-listener/config.json)
+  --> Scaler (uses config for K8s patches)
 ```
 
-This is a critical step — if the listener doesn't AcquireJobs, those jobs won't be assigned to this scale set and will eventually time out or go elsewhere.
+### Scaling Configurations
 
-### Statistics Object
+| Config | Behavior |
+|--------|----------|
+| Both omitted | 0 to MaxInt32 (unbounded, scales to zero when idle) |
+| `minRunners: 5` | Always 5 warm runners ready, scales up from there |
+| `maxRunners: 30` | Never exceed 30 concurrent runners |
+| Both set to `0` | Drains — no new runners created |
 
-Every message from GitHub includes a `RunnerScaleSetStatistic`:
-
-```go
-type RunnerScaleSetStatistic struct {
-    TotalAvailableJobs     int   // jobs waiting to be acquired
-    TotalAcquiredJobs      int   // jobs acquired but not yet assigned to a runner
-    TotalAssignedJobs      int   // jobs assigned to a runner (queued + running)
-    TotalRunningJobs       int   // jobs actively executing
-    TotalRegisteredRunners int   // runners registered with GitHub
-    TotalBusyRunners       int   // runners currently running a job
-    TotalIdleRunners       int   // runners idle (registered but no job)
-}
-```
-
-The scaling formula uses **TotalAssignedJobs** — this is the most accurate measure of "how many runners do we need?" because it includes both queued and running jobs.
-
-### Timing and Convergence
-
-```
-Time ─────────────────────────────────────────────────────────────────▶
-
-GitHub Queue     │ JobAvailable msg queued │
-                 │                         │
-Listener Poll    │    ← long-poll blocks → │ GetMessage returns
-                 │                         │ DeleteMessage (ACK)
-                 │                         │ AcquireJobs
-                 │                         │ HandleDesiredRunnerCount
-                 │                         │   → PATCH EphemeralRunnerSet
-                 │                         │
-K8s API          │                         │    EphemeralRunnerSet reconcile triggered
-                 │                         │      → create EphemeralRunner CRs
-                 │                         │
-                 │                         │    EphemeralRunner reconcile triggered
-                 │                         │      → request JIT token from GitHub
-                 │                         │      → create Pod
-                 │                         │
-Pod Scheduling   │                         │    Pod pending → scheduled → running
-                 │                         │    Runner registers with GitHub
-                 │                         │
-GitHub           │                         │    Assigns job to registered runner
-                 │                         │    Sends JobStarted message
-                 │                         │
-Listener Poll    │                         │    GetMessage returns JobStarted
-                 │                         │      → HandleJobStarted (patch runner status)
-                 │                         │      → HandleDesiredRunnerCount (may be same)
-```
-
-Typical end-to-end latency from job queued to pod running: **10-30 seconds** depending on:
-- Long-poll timing (immediate if listener is already waiting)
-- K8s scheduling (node availability, image pull)
-- JIT token request to GitHub (1-2 API calls)
-
-### Edge Cases and Failure Modes
-
-| Scenario | What happens |
-|----------|-------------|
-| Listener pod restarts | New session created; initial statistics re-evaluated; may temporarily double-patch |
-| Message queue token expires | Auto-refreshed (refreshMessageSession); transparent retry |
-| K8s PATCH conflict | Error returned to listener → listener crashes → restarts and re-evaluates |
-| AcquireJobs partially fails | Some jobs acquired, others not — GitHub reassigns unclaimed jobs in next batch |
-| Runner pod fails before registering | EphemeralRunner controller retries (5x with backoff: 5s, 10s, 20s, 40s, 80s) |
-| Scale-down race (job starts during delete) | GitHub returns JobStillRunningError → runner is skipped |
-| PatchID overflow | Wraps at MaxInt32 back to 0 (safe — 0 triggers force-state path) |
-
-### Key Source Files
-
-| Component | File | Critical Function |
-|-----------|------|-------------------|
-| Message loop | `github.com/actions/scaleset@v0.3.0/listener/listener.go` | `Run()`, `handleMessage()` |
-| Session/polling | `github.com/actions/scaleset@v0.3.0/session_client.go` | `GetMessage()`, `AcquireJobs()` |
-| Scaler | `cmd/ghalistener/scaler/scaler.go` | `HandleDesiredRunnerCount()`, `setDesiredWorkerState()` |
-| ERS controller | `controllers/actions.github.com/ephemeralrunnerset_controller.go` | `Reconcile()`, `deleteIdleEphemeralRunners()` |
-| Runner builder | `controllers/actions.github.com/resourcebuilder.go:622` | `newEphemeralRunner()` — stamps PatchID annotation |
-| Types | `github.com/actions/scaleset@v0.3.0/types.go` | `RunnerScaleSetStatistic`, `RunnerScaleSetMessage` |
+Formula: `desired = min(minRunners + assignedJobs, maxRunners)`
 
 ---
 
-## Deep Dive: EphemeralRunner State Machine (Pod Creation, Retries, Failure Handling)
+## 4. Security Model
 
-The EphemeralRunner controller (`ephemeralrunner_controller.go`) manages the full lifecycle of a single runner — from JIT config registration through pod creation, monitoring, retries, and cleanup.
+### Authentication: GitHub App vs PAT
 
-### State Machine Diagram
+ARC authenticates to GitHub using one of two methods:
 
+| | GitHub App | Personal Access Token (PAT) |
+|---|---|---|
+| **Scope** | Per-installation (org or repo) | Per-user |
+| **Rotation** | Auto (JWT → installation token, 1hr TTL) | Manual (classic) or auto (fine-grained, max 1yr) |
+| **Permissions** | Granular (select only what's needed) | Broad token scopes |
+| **Rate limits** | Higher (per-app installation) | Shared with user |
+| **Revocation** | Org admin can revoke installation | Token owner revokes |
+| **Best for** | Production, org-wide | Personal repos, quick setup |
+
+**GitHub App flow:**
 ```
-                              ┌─────────────────────────────────┐
-                              │  EphemeralRunner CR Created      │
-                              │  (by EphemeralRunnerSet ctrl)    │
-                              └───────────────┬─────────────────┘
-                                              │
-                                              ▼
-                              ┌─────────────────────────────────┐
-                              │  Add Finalizers                  │
-                              │  - ephemeralrunner.../finalizer  │
-                              │  - ephemeralrunner.../runner-    │
-                              │    registration-finalizer        │
-                              └───────────────┬─────────────────┘
-                                              │
-                                              ▼
-                              ┌─────────────────────────────────┐
-                              │  JIT Config Phase                │
-                              │  Secret exists?                  │
-                              └───────┬───────────────┬─────────┘
-                                      │ no            │ yes
-                                      ▼               │
-                              ┌───────────────────┐   │
-                              │ GenerateJitRunner  │   │
-                              │ Config (GitHub API)│   │
-                              └──┬────┬────┬──────┘   │
-                    ok ──────────┘    │    │           │
-                    retryable ────────┘    │           │
-                    fatal ────────────────►│           │
-                                          │           │
-                    ┌─────────────────────┘           │
-                    ▼                                  │
-          ┌──────────────────┐                        │
-          │ Delete self      │                        │
-          │ (unrecoverable)  │                        │
-          └──────────────────┘                        │
-                                                      │
-                              ┌────────────────────────┘
-                              │
-                              ▼
-                ┌───────────────────────────────────┐
-                │  Create Secret (JIT config data)   │
-                │  → contains runnerId, runnerName   │
-                └───────────────┬───────────────────┘
-                                │
-                                ▼
-                ┌───────────────────────────────────┐
-                │  Update Status: RunnerID           │
-                │  (runner is now registered with    │
-                │   GitHub Actions service)          │
-                └───────────────┬───────────────────┘
-                                │
-                                ▼
-                ┌───────────────────────────────────┐
-                │  Check failure count               │
-                │  len(Failures) > 5?                │
-                ├───────────┬───────────────────────┘
-                │ yes       │ no
-                ▼           ▼
-        ┌──────────┐  ┌───────────────────────────────┐
-        │ Delete   │  │  Backoff check                 │
-        │ self     │  │  (if lastFailure + backoff     │
-        │ (give up)│  │   > now → requeue with delay)  │
-        └──────────┘  └───────────────┬────────────────┘
-                                      │
-                                      ▼
-                      ┌───────────────────────────────┐
-                      │  Pod exists?                    │
-                      └──────┬───────────────┬────────┘
-                             │ no            │ yes
-                             ▼               ▼
-                      ┌──────────────┐  ┌──────────────────────┐
-                      │ Create Pod   │  │ Inspect Pod Status   │
-                      └──────────────┘  └──────────────────────┘
-                                              │
-                     ┌────────────────────────┼──────────────────┐
-                     │                        │                  │
-                     ▼                        ▼                  ▼
-            ┌────────────────┐  ┌─────────────────────┐  ┌──────────────┐
-            │ Pod Running    │  │ Pod Failed           │  │ Pod Succeeded│
-            │ → update phase │  │ → retry or fail     │  │ → delete self│
-            └────────────────┘  └─────────────────────┘  └──────────────┘
+Controller has: App ID + Private Key (PEM)
+  1. Signs JWT (RS256, 10min TTL)
+  2. Exchanges JWT for Installation Token (1hr TTL)
+  3. Uses Installation Token for all Actions Service API calls
+  4. Auto-refreshes before expiry
 ```
 
-### Phases
-
-| Phase | Meaning | Terminal? |
-|-------|---------|-----------|
-| `""` (empty) | Just created, not yet processed | No |
-| `Pending` | JIT config obtained, pod being created/scheduled | No |
-| `Running` | Pod is running, runner registered with GitHub | No |
-| `Succeeded` | Runner completed job successfully (exit code 0) | Yes |
-| `Failed` | Unrecoverable failure after retries exhausted | Yes |
-| `Outdated` | Runner exited with code 7 (version mismatch) | Yes |
-
-`IsDone()` returns true for Succeeded, Failed, or Outdated.
-
-### Two Finalizers
-
-Each EphemeralRunner has two finalizers, serving different cleanup purposes:
-
-| Finalizer | Purpose | Removal condition |
-|-----------|---------|-------------------|
-| `ephemeralrunner.actions.github.com/finalizer` | Cleanup pod + secret | Pod and secret deleted |
-| `ephemeralrunner.actions.github.com/runner-registration-finalizer` | Deregister from GitHub | `RemoveRunner()` succeeds or runner has no job |
-
-Deletion sequence when `DeletionTimestamp` is set:
-1. Try to remove runner from GitHub (registration finalizer)
-   - If `JobStillRunningError` → requeue after 30s
-   - If success → remove registration finalizer
-2. Delete pod and JIT secret (resource finalizer)
-3. If container hooks configured → clean up linked pods and secrets
-4. Remove resource finalizer → CR deleted
-
-### JIT Config Flow (Runner Registration)
-
-When the EphemeralRunner CR is first created, it has no secret:
-
+**PAT flow:**
 ```
-1. Call actionsClient.GenerateJitRunnerConfig(name, scaleSetID)
-   → POST to GitHub Actions service
-   → Returns: runner ID, encoded JIT config, runner name
-
-2. If SUCCESS:
-   → Create K8s Secret with data:
-     - "runnerId": <id>
-     - "runnerName": <name>  
-     - ".runner_jit_config": <encoded config>
-   → Update EphemeralRunner.Status.RunnerID and RunnerName
-
-3. If RunnerExistsError (name collision):
-   → Get runner by name from GitHub
-   → If it belongs to THIS scale set:
-     - Remove it from GitHub
-     - Return retryableError (requeue immediately)
-   → If it belongs to ANOTHER scale set:
-     - Return fatalError (delete this EphemeralRunner)
-   → If it no longer exists:
-     - Return retryableError (requeue immediately)
+Controller has: Token string
+  1. Uses token directly in Authorization header
+  2. No refresh mechanism — token must be rotated externally
 ```
 
-### Pod Creation
+The authentication credential (App or PAT) is stored in a K8s Secret referenced by `githubConfigSecret` in the AutoscalingRunnerSet spec. The controller reads this secret to authenticate all GitHub API calls: registering scale sets, creating sessions, generating JIT configs.
 
-Once the secret exists and RunnerID is set:
+### JIT (Just-In-Time) Runner Tokens
 
-```go
-func createPod(runner, secret):
-  1. Build pod spec from runner.Spec.PodTemplateSpec
-  2. Inject proxy env vars (if configured)
-  3. Set controller reference (EphemeralRunner owns the pod)
-  4. Create pod via K8s API
-```
+Every runner pod needs credentials to connect to GitHub. ARC uses **JIT configuration** — single-use, short-lived tokens generated per runner.
 
-Pod creation error handling:
-
-| Error type | Action |
-|-----------|--------|
-| `nil` (success) | Return, wait for pod events |
-| `AlreadyExists` | Requeue after 5s (pod event may arrive) |
-| `Invalid` | Mark EphemeralRunner as **Failed** (unrecoverable) |
-| `Forbidden` + quota exceeded + age < 10min | Requeue after 30s (quota may free up) |
-| `Forbidden` + quota exceeded + age > 10min | Delete self (recreate with fresh JIT token) |
-| `Forbidden` (other) | Mark as **Failed** |
-| Default error | Return error (controller-runtime will requeue) |
-
-### Retry Mechanism (Exponential Backoff)
-
-Failed pods don't immediately cause the EphemeralRunner to fail. Instead:
+**Why JIT exists (vs. pre-registered runners):**
 
 ```
-Backoff schedule:
-  Attempt 0: 0s      (initial)
-  Attempt 1: 5s
-  Attempt 2: 10s
-  Attempt 3: 20s
-  Attempt 4: 40s
-  Attempt 5: 80s
-  Attempt 6: → DELETE (give up after 5 failures)
+WITHOUT JIT (traditional self-hosted runners):
+  1. Admin manually registers runner → gets a long-lived token
+  2. Token stored on disk → risk if compromised
+  3. Runner reuses token across jobs → lateral movement risk
+  4. Must manually deregister on teardown
+
+WITH JIT (ARC ephemeral runners):
+  1. Controller calls GitHub API: "Generate JIT config for runner X"
+  2. GitHub returns single-use encoded config (contains token + registration)
+  3. Config stored as K8s Secret, mounted into pod
+  4. Runner uses it once → pod dies → token is invalid
+  5. No manual registration/deregistration needed
 ```
 
-How it works:
-1. Pod fails → `deletePodAsFailed()` is called
-2. Pod is deleted
-3. `Status.Failures[podUID] = now` is patched (map keyed by pod UID)
-4. Next reconcile checks `len(Failures) > maxFailures (5)`:
-   - If yes → delete the EphemeralRunner (it will be recreated by EphemeralRunnerSet)
-   - If no → compute `lastFailure + backoff[len(Failures)]`
-   - If still in backoff period → requeue with delay
-   - If past backoff → proceed to create new pod
-
-The Failures map uses pod UIDs as keys, ensuring each distinct pod failure is counted exactly once.
-
-### Pod Status Inspection (The Main Switch)
-
-When the pod exists, the controller inspects `pod.Status.Phase` and `runnerContainerStatus`:
-
+**JIT config lifecycle:**
 ```
-Pod inspection logic:
-
-1. pod.Status.Phase == PodFailed (all containers stopped):
-   └─ runner container terminated?
-      ├─ No state → delete pod (restart)
-      ├─ ExitCode 0 → SUCCESS (delete EphemeralRunner, sidecar failure ignored)
-      ├─ ExitCode 7 → OUTDATED (mark as outdated)
-      └─ Other → delete pod or EphemeralRunner
-
-2. initContainerFailed(pod):
-   └─ Any init container exited non-zero → delete pod (restart)
-
-3. runner container status == nil:
-   └─ Pod still starting → wait (no action)
-
-4. runner container NOT terminated:
-   └─ Still running → update EphemeralRunner phase to "Running"
-
-5. runner container terminated:
-   ├─ ExitCode 0 → SUCCESS (delete EphemeralRunner)
-   ├─ ExitCode 7 → OUTDATED
-   └─ Other → delete pod or EphemeralRunner
+EphemeralRunner Controller                    GitHub
+        |                                       |
+        |-- GenerateJitRunnerConfig(name) ----->|
+        |                                       |-- Creates runner registration
+        |<---- {encodedJITConfig, runnerRef} ---|    (ID assigned, single-use)
+        |                                       |
+        |-- Create K8s Secret (jit-config) ---->| (stored in runner namespace)
+        |-- Create Pod (mounts secret) -------->|
+        |                                       |
+        [Pod starts]                            |
+        |   Runner binary reads JIT config      |
+        |   Runner connects to GitHub --------->|-- Validates token
+        |                                       |-- Assigns job
+        [Job runs]                              |
+        [Pod terminates]                        |
+        |                                       |-- Token now invalid
+        |-- Delete Secret ----------------------|
+        |-- Remove runner registration -------->|
 ```
 
-### Exit Code Semantics
+**Analogy:** JIT config is like a hotel key card — it's programmed for one guest, one room, one stay. When you check out, the card is deactivated.
 
-| Exit Code | Meaning | Controller Action |
-|-----------|---------|-------------------|
-| 0 | Job completed successfully | Delete EphemeralRunner → Succeeded |
-| 7 | Runner version outdated (needs upgrade) | Mark as Outdated, deregister |
-| Other non-zero | Failure (crash, OOM, misconfiguration) | Retry (delete pod, backoff) |
+### RBAC & Cross-Namespace Permissions
 
-Exit code 7 is special: the GitHub runner binary uses it to signal that the server has a newer version available. The controller marks the runner as `Outdated` rather than failed — the AutoscalingRunnerSet controller will eventually replace it.
+ARC uses a cross-namespace RBAC model. The listener pod runs in the **controller namespace** but needs to modify resources in the **runner namespace**.
 
-### deleteEphemeralRunnerOrPod Decision
+**Resources created by the AutoscalingListener controller:**
 
-When a pod fails, the controller must decide: retry the pod, or give up on the EphemeralRunner entirely?
+| Resource | Namespace | Purpose |
+|----------|-----------|---------|
+| ServiceAccount | Controller ns | Identity for the listener pod |
+| Role | Runner ns | Permissions to patch ERS + ER resources |
+| RoleBinding | Runner ns | Binds Role → ServiceAccount (cross-ns) |
+| Config Secret | Controller ns | Listener configuration JSON |
+| Listener Pod | Controller ns | Runs the /ghalistener binary |
 
-```
-deleteEphemeralRunnerOrPod(ephemeralRunner, pod):
-  If runner HasJob() (status.jobID is set):
-    → Runner was assigned work but crashed
-    → This is a serious failure (faulty entrypoint or external kill)
-    → DELETE the EphemeralRunner entirely
-    → Also try to RemoveRunner from GitHub (best effort)
-  
-  If runner does NOT have a job:
-    → Runner crashed before getting work
-    → This might be transient (node issue, image pull fail)
-    → Delete just the Pod (triggers retry with backoff)
-    → Track failure in Status.Failures
-```
+**Role permissions (exact rules):**
 
-### Resource Quota Handling
+```yaml
+# The listener can patch ONE specific EphemeralRunnerSet (by name)
+- apiGroups: ["actions.github.com"]
+  resources: ["ephemeralrunnersets"]
+  resourceNames: ["<specific-ers-name>"]
+  verbs: ["patch"]
 
-A special case for `Forbidden` errors during pod creation:
-
-```
-If error contains "exceeded quota:":
-  If runner was created < 10 minutes ago:
-    → Requeue after 30s (quota might free up)
-  If runner was created > 10 minutes ago:
-    → Delete the EphemeralRunner (JIT token may expire; recreate fresh)
+# The listener can patch status of EphemeralRunners (for job started/completed)
+- apiGroups: ["actions.github.com"]
+  resources: ["ephemeralrunners", "ephemeralrunners/status"]
+  verbs: ["patch"]
 ```
 
-The 10-minute threshold exists because JIT tokens have a limited lifetime. If we wait too long, the token expires and the runner can never register, so it's better to delete and let the EphemeralRunnerSet create a fresh one.
+This is **least-privilege by design**: the listener can only modify the one ERS it manages, not others in the same namespace.
 
-### Container Hooks Cleanup
-
-If the runner has `ACTIONS_RUNNER_CONTAINER_HOOKS` env var set, it may have created additional pods and secrets (for running workflow steps in separate containers). On cleanup:
-
-1. List all pods with label `runner-pod: <ephemeralRunner.Name>`
-2. Delete each one
-3. List all secrets with label `runner-pod: <ephemeralRunner.Name>`
-4. Delete each one
-
-### Complete Lifecycle Timeline
-
-```
-Time ──────────────────────────────────────────────────────────────────────▶
-
-ERS Controller    │ Creates EphemeralRunner CR │
-                  │  (with PatchID annotation) │
-                  │                            │
-ER Controller     │                            │ Reconcile triggered
-                  │                            │ Add finalizers
-                  │                            │ → GenerateJitRunnerConfig (GitHub API call)
-                  │                            │ → Create Secret (runnerId, JIT config)
-                  │                            │ → Patch Status (RunnerID, RunnerName)
-                  │                            │ → Create Pod
-                  │                            │
-Pod Lifecycle     │                            │   Pod Pending → Scheduled → Running
-                  │                            │   Runner binary starts
-                  │                            │   Connects to GitHub, registers
-                  │                            │   Picks up assigned job
-                  │                            │
-Listener          │                            │   JobStarted message received
-                  │                            │   → Patches ER.Status with job info
-                  │                            │
-Pod Lifecycle     │                            │   Job executes...
-                  │                            │   Job completes → runner exits (code 0)
-                  │                            │   Pod phase → Succeeded
-                  │                            │
-ER Controller     │                            │   Reconcile: exit code 0
-                  │                            │   → Delete EphemeralRunner
-                  │                            │   → Finalization:
-                  │                            │     - RemoveRunner from GitHub
-                  │                            │     - Delete Pod
-                  │                            │     - Delete Secret
-                  │                            │     - Remove finalizers
-                  │                            │
-ERS Controller    │                            │   Reconcile: runner gone
-                  │                            │   → Update status counts
-```
-
-### Failure Scenario: Pod Crashes Twice Then Succeeds
-
-```
-Attempt 1:
-  → Create Pod → Pod crashes (non-zero exit, no job assigned)
-  → deletePodAsFailed(): delete pod, record failure[pod-uid-1]
-  → Backoff: requeue after 5s
-
-Attempt 2 (after 5s):
-  → Create Pod → Pod crashes again (e.g., image pull backoff)  
-  → deletePodAsFailed(): delete pod, record failure[pod-uid-2]
-  → Backoff: requeue after 10s
-
-Attempt 3 (after 10s):
-  → Create Pod → Pod starts successfully
-  → Runner registers, picks up job, completes
-  → ExitCode 0 → Delete EphemeralRunner → done
-```
-
-### Failure Scenario: Permanent Failure (Exceeds Max Retries)
-
-```
-Attempts 1-5: Pod keeps crashing
-  → Each time: delete pod, record failure, backoff
-
-Attempt 6:
-  → len(Failures) = 6 > maxFailures(5)
-  → Delete EphemeralRunner entirely
-  → EphemeralRunnerSet controller will eventually create a replacement
-    (on next listener patch with a new patchID)
-```
-
-### Key Source Files
-
-| Component | File | Key functions |
-|-----------|------|---------------|
-| Controller | `controllers/actions.github.com/ephemeralrunner_controller.go` | `Reconcile()`, `createRunnerJitConfig()`, `createPod()`, `deleteEphemeralRunnerOrPod()`, `deletePodAsFailed()` |
-| Types/Phases | `apis/actions.github.com/v1alpha1/ephemeralrunner_types.go` | `IsDone()`, `HasJob()`, phase constants |
-| Error types | `controllers/actions.github.com/error.go` | `retryableError`, `fatalError` |
-| Backoff config | `ephemeralrunner_controller.go:56-63` | `failedRunnerBackoff` array, `maxFailures = 5` |
-
----
-
-## Deep Dive: Rolling Update Flow (What Happens When You Change the Runner Image)
-
-When you change any runner-affecting spec (image, env vars, volumes, labels, etc.) in the AutoscalingRunnerSet, the system performs a rolling update. The behavior depends on the configured **UpdateStrategy**: `immediate` (default) or `eventual`.
-
-### Change Detection: The Hash Mechanism
-
-Three hashes drive the update detection system:
-
-| Hash | Annotation | What it covers | Triggers |
-|------|-----------|----------------|----------|
-| `Hash()` | `actions.github.com/change-hash` | Entire ARS spec + labels | ARS status reset to Pending |
-| `RunnerSetSpecHash()` | `actions.github.com/runner-spec-hash` | GitHubConfigUrl, Secret, RunnerGroup, ScaleSetName, Proxy, TLS, **Template** | New EphemeralRunnerSet creation |
-| `ListenerSpecHash()` | `actions.github.com/runner-spec-hash` (on listener) | Full ARS spec | Listener pod recreation |
-
-The critical one for runner image changes is `RunnerSetSpecHash()`:
-
-```go
-func (ars *AutoscalingRunnerSet) RunnerSetSpecHash() string {
-    spec := &runnerSetSpec{
-        GitHubConfigUrl:    ars.Spec.GitHubConfigUrl,
-        GitHubConfigSecret: ars.Spec.GitHubConfigSecret,
-        RunnerGroup:        ars.Spec.RunnerGroup,
-        RunnerScaleSetName: ars.Spec.RunnerScaleSetName,
-        Proxy:              ars.Spec.Proxy,
-        GitHubServerTLS:    ars.Spec.GitHubServerTLS,
-        Template:           ars.Spec.Template,    // ← includes container image
-    }
-    return hash.ComputeTemplateHash(&spec)
-}
-```
-
-Any change to `.spec.template` (which includes container images, env vars, volumes, resource limits, etc.) will produce a different hash.
-
-### Overview: Two Update Strategies
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  User changes AutoscalingRunnerSet spec (e.g., runner image)            │
-└───────────────────────────────────┬─────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ARS Controller detects hash mismatch:                                   │
-│  latestRunnerSet.Annotations["runner-spec-hash"] ≠ ars.RunnerSetSpecHash │
-└───────────────────────────────┬─────────────────┬───────────────────────┘
-                                │                 │
-              ┌─────────────────┘                 └─────────────────┐
-              │ UpdateStrategy = "immediate"                         │ UpdateStrategy = "eventual"
-              ▼                                                      ▼
-┌─────────────────────────────────┐          ┌─────────────────────────────────┐
-│ 1. Delete listener              │          │ 1. Delete listener              │
-│ 2. Create NEW EphemeralRunnerSet│          │ 2. Patch old ERS replicas→0     │
-│    (replicas=0, new hash)       │          │ 3. Wait for all runners to      │
-│ 3. Delete OLD EphemeralRunnerSets│         │    finish (pending+running = 0) │
-│ 4. Create new listener          │          │ 4. Create NEW EphemeralRunnerSet│
-│    → listener starts scaling    │          │ 5. Delete OLD EphemeralRunnerSets│
-│    → old runners finish         │          │ 6. Create new listener          │
-│      naturally (ephemeral)      │          │    → listener starts scaling    │
-└─────────────────────────────────┘          └─────────────────────────────────┘
-```
-
-### Strategy: "immediate" (Default)
-
-This is the simpler and faster path. The system doesn't wait for existing runners to drain.
-
-#### Step-by-Step Flow
-
-```
-Time ──────────────────────────────────────────────────────────────────────▶
-
-1. ARS spec changes (e.g., container image updated via helm upgrade)
-   
-2. ARS Controller reconcile:
-   a. Detects changeHash mismatch → updates annotation, sets phase=Pending
-   
-3. Next reconcile:
-   a. Detects listenerValuesHashChanged or listenerSpecHashChanged
-   b. DELETE existing AutoscalingListener
-   c. Return (wait for listener deletion to propagate)
-
-4. Next reconcile:
-   a. listenerFound = false
-   b. Detects RunnerSetSpecHash mismatch:
-      latestRunnerSet.Annotations["runner-spec-hash"] ≠ ars.RunnerSetSpecHash()
-   c. drainingJobs() → returns FALSE (strategy is "immediate")
-   d. Calls createEphemeralRunnerSet():
-      - Creates NEW EphemeralRunnerSet with:
-        - replicas: 0
-        - annotation "runner-spec-hash" = new hash
-        - spec from updated ARS template
-
-5. Next reconcile:
-   a. latestRunnerSet = NEW runner set (sorted by creation time, newest first)
-   b. Hash now matches ✓
-   c. oldRunnerSets = [OLD runner set] → delete them
-   d. listenerFound = false → create new AutoscalingListener
-
-6. AutoscalingListener Controller:
-   - Creates listener pod with new config
-   - Listener starts polling GitHub
-   - Reports initial statistics
-   - Starts scaling new EphemeralRunnerSet
-
-7. OLD EphemeralRunnerSet being deleted:
-   - Finalizer blocks actual deletion
-   - Old runners that are RUNNING jobs continue until done
-   - EphemeralRunnerSet controller cleans up finished runners
-   - Once all runners are gone, finalizer removed, ERS deleted
-```
-
-**Key insight**: With `immediate`, you may temporarily have TWO sets of runners:
-- Old runners finishing their current jobs (can't be killed mid-job)
-- New runners being created by the new listener for new jobs
-
-This causes **overprovisioning** proportional to how many jobs are currently running.
-
-### Strategy: "eventual"
-
-This prevents overprovisioning by waiting for all existing runners to finish before creating new ones.
-
-#### Step-by-Step Flow
-
-```
-Time ──────────────────────────────────────────────────────────────────────▶
-
-1. ARS spec changes
-
-2. ARS Controller reconcile:
-   a. Detects hash mismatch
-   b. DELETE existing AutoscalingListener
-
-3. Next reconcile:
-   a. Detects RunnerSetSpecHash mismatch
-   b. drainingJobs() → checks:
-      latestRunnerSetStatus.RunningEphemeralRunners + PendingEphemeralRunners > 0?
-   c. If YES (jobs still running):
-      - Patches old EphemeralRunnerSet: replicas=0, patchID=0
-        (this tells the ERS controller to scale down idle runners)
-      - Returns (does NOT create new ERS yet)
-      - Will requeue and check again
-
-4. Subsequent reconciles (while draining):
-   a. Same check: running + pending > 0?
-   b. Keeps patching replicas=0 (idempotent)
-   c. Runners with active jobs continue until done
-   d. Idle runners get scaled down
-   e. Eventually: running=0, pending=0
-
-5. Once drained (running + pending = 0):
-   a. drainingJobs() → FALSE
-   b. Creates NEW EphemeralRunnerSet
-   c. Proceeds same as "immediate" from step 5 onward
-
-6. Later: Listener not found → but drainingJobs() still applies!
-   If runners are still draining when the listener creation check is reached:
-   - "Creating a new AutoscalingListener is waiting for the running
-     and pending runners to finish"
-   - Returns without creating listener
-```
-
-**Key insight**: With `eventual`, there's a **blackout period** where no new jobs can be picked up (no listener running, no new runners being created). Jobs queued during this window wait until the new listener comes up.
-
-### The "Outdated" Path (Exit Code 7)
-
-A third update path exists — triggered from the runner binary itself rather than a spec change:
-
-```
-1. GitHub Actions service has a newer runner version available
-2. Runner binary detects this and exits with code 7
-3. EphemeralRunner controller: markAsOutdated()
-   → Sets EphemeralRunner.Status.Phase = "Outdated"
-4. EphemeralRunnerSet controller: updateStatus()
-   → Detects outdated runners
-   → Sets EphemeralRunnerSet.Status.Phase = "Outdated"
-5. ARS Controller:
-   → Detects latestRunnerSet.Status.Phase == EphemeralRunnerSetPhaseOutdated
-   → Sets ARS phase to "Outdated"
-   → Calls cleanUpResources():
-     a. Delete listener
-     b. Delete all EphemeralRunnerSets
-     c. Delete RunnerScaleSet from GitHub
-   → Once clean, ARS reconciles from scratch:
-     - Creates new RunnerScaleSet on GitHub
-     - Creates new EphemeralRunnerSet
-     - Creates new listener
-```
-
-This is the most disruptive path — it tears everything down and recreates from scratch, including the GitHub-side scale set registration.
-
-### The EphemeralRunnerSets Sorting
-
-The controller maintains multiple EphemeralRunnerSets during transitions:
-
-```go
-type EphemeralRunnerSets struct { list }
-
-func (rs *EphemeralRunnerSets) latest()  // newest by creation time (the "current" one)
-func (rs *EphemeralRunnerSets) old()     // all except newest (to be cleaned up)
-func (rs *EphemeralRunnerSets) all()     // everything
-
-// Sort: newest first (After, not Before)
-sort.Slice(rs.list.Items, func(i, j int) bool {
-    return rs.list.Items[i].GetCreationTimestamp().After(
-        rs.list.Items[j].GetCreationTimestamp().Time)
-})
-```
-
-After a spec change, the system briefly has:
-- `latest()` = the new ERS (matches current hash)
-- `old()` = [old ERS] (hash mismatch, being drained/deleted)
-
-### Listener Recreation
-
-The listener is recreated when either:
-1. `annotationKeyValuesHash` changed (any ARS spec field)
-2. `annotationKeyRunnerSpecHash` on listener doesn't match `ListenerSpecHash()`
-
-The listener points to a **specific EphemeralRunnerSet by name** in its config:
-```go
-func createAutoScalingListenerForRunnerSet(ars, ephemeralRunnerSet):
-    // The listener's config includes:
-    config.EphemeralRunnerSetName = ephemeralRunnerSet.Name
-    config.EphemeralRunnerSetNamespace = ephemeralRunnerSet.Namespace
-```
-
-This is why the listener MUST be recreated on update — it needs to point to the new EphemeralRunnerSet.
-
-### New EphemeralRunnerSet Starts at Replicas=0
-
-Critically, a newly created EphemeralRunnerSet always starts with `replicas: 0`:
-
-```go
-Spec: v1alpha1.EphemeralRunnerSetSpec{
-    Replicas: 0,    // ← always starts empty
-    ...
-}
-```
-
-It only scales up once the new listener is created, connects to GitHub, receives the initial session statistics, and patches the desired count.
-
-### What "Changing the Runner Image" Actually Means
-
-When you do `helm upgrade` with a new runner image:
-
-1. Helm updates the `AutoscalingRunnerSet` CR's `.spec.template.spec.containers[].image`
-2. This changes `RunnerSetSpecHash()` (because `Template` is included in the hash)
-3. The rolling update flow kicks in
-4. Existing runner pods keep their old image until they finish
-5. New runner pods use the new image
-
-The controller itself (`/manager`) and listener (`/ghalistener`) images are NOT affected by this change — those are controlled by the controller Helm chart (`gha-runner-scale-set-controller`), not the runner set chart (`gha-runner-scale-set`).
-
-### Comparison Table
-
-| Aspect | Immediate | Eventual |
-|--------|-----------|----------|
-| Downtime (no new jobs) | Minimal (listener recreated quickly) | Longer (waits for drain) |
-| Overprovisioning | Yes (old + new runners coexist) | No |
-| Job safety | Running jobs always complete | Running jobs always complete |
-| Cost impact | Temporarily higher (2x runners possible) | No cost spike |
-| Complexity | Simpler | More states to manage |
-| Default | Yes | No |
-| Best for | Small scale, fast deploys | Large scale, cost-sensitive |
-
-### Practical Timeline: Image Update with "immediate"
-
-```
-T+0s    helm upgrade (image changes in ARS spec)
-T+1s    ARS controller detects hash change, deletes listener
-T+2s    Listener pod terminating, session closed with GitHub
-T+3s    ARS controller creates new EphemeralRunnerSet (replicas=0)
-T+4s    ARS controller deletes old EphemeralRunnerSet
-T+5s    ARS controller creates new AutoscalingListener
-T+7s    AutoscalingListener controller creates listener pod
-T+10s   Listener pod running, session created with GitHub
-T+11s   Initial statistics received, listener patches ERS replicas
-T+12s   EphemeralRunnerSet controller creates new EphemeralRunners
-T+15s   New runner pods starting (new image)
-T+20s   New runners registered and picking up jobs
-
-Meanwhile:
-T+0s onward  Old runners still executing their current jobs
-T+30-300s    Old runners finishing, old ERS draining
-T+300s+      Old ERS finalizer removed, fully cleaned up
-```
-
-### Key Source Files
-
-| Component | File | Key function |
-|-----------|------|-------------|
-| Update detection | `autoscalingrunnerset_controller.go:287` | Hash comparison on `latestRunnerSet` |
-| Strategy check | `autoscalingrunnerset_controller.go:394` | `drainingJobs()` |
-| New ERS creation | `autoscalingrunnerset_controller.go:709` | `createEphemeralRunnerSet()` |
-| Hash computation | `apis/.../autoscalingrunnerset_types.go:390` | `RunnerSetSpecHash()` |
-| ERS builder | `resourcebuilder.go:555` | `newEphemeralRunnerSet()` — stamps hash annotation |
-| Old ERS cleanup | `autoscalingrunnerset_controller.go:306` | `deleteEphemeralRunnerSets(oldRunnerSets)` |
-| Listener recreation | `autoscalingrunnerset_controller.go:271-284` | Hash comparison → delete listener |
-| Outdated path | `autoscalingrunnerset_controller.go:246-268` | `cleanUpResources()` on outdated |
-| ERS sorting | `autoscalingrunnerset_controller.go:1143` | Sort by creation time (newest first) |
-
----
-
-## Deep Dive: RBAC & Secrets Setup (How the Listener Gets Permission)
-
-The listener pod needs to patch EphemeralRunnerSet and EphemeralRunner resources — but it runs in a **different namespace** than those resources. This cross-namespace permission model is one of the more complex aspects of the ARC architecture.
-
-### Namespace Layout
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Controller Namespace (e.g., "arc-systems")                          │
-│                                                                      │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ /manager Pod     │  │ AutoscalingLis-  │  │ Listener Pod     │  │
-│  │ (controller)     │  │ tener CR         │  │ (ghalistener)    │  │
-│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
-│                                                                      │
-│  ┌──────────────────┐  ┌──────────────────┐                        │
-│  │ ServiceAccount   │  │ Config Secret    │                        │
-│  │ (for listener)   │  │ (listener config)│                        │
-│  └──────────────────┘  └──────────────────┘                        │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│  Runner Namespace (e.g., "arc-runners")                              │
-│                                                                      │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
-│  │ AutoscalingRun-  │  │ EphemeralRunner- │  │ EphemeralRunner  │  │
-│  │ nerSet CR        │  │ Set CR           │  │ CRs + Pods       │  │
-│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
-│                                                                      │
-│  ┌──────────────────┐  ┌──────────────────┐                        │
-│  │ Role             │  │ RoleBinding      │                        │
-│  │ (for listener)   │  │ (cross-namespace)│                        │
-│  └──────────────────┘  └──────────────────┘                        │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-Key design: The listener pod lives in the **controller namespace** but the Role and RoleBinding live in the **runner namespace** (where the EphemeralRunnerSet lives). The RoleBinding references the ServiceAccount by namespace+name, enabling cross-namespace access.
-
-### RBAC Resources Created
-
-The AutoscalingListener controller creates these resources in sequence (one per reconcile loop):
-
-```
-Reconcile 1: Create ServiceAccount
-  → in: controller namespace
-  → name: <listener-name>
-  → owned by: AutoscalingListener CR
-
-Reconcile 2: Create Role
-  → in: RUNNER namespace (AutoscalingRunnerSetNamespace)
-  → name: <listener-name>
-  → rules: see below
-  → NOT owned by AutoscalingListener (cross-namespace ownership not possible)
-  → tracked via labels: auto-scaling-listener-namespace, auto-scaling-listener-name
-
-Reconcile 3: Create RoleBinding
-  → in: RUNNER namespace
-  → name: <listener-name>
-  → roleRef: the Role created above
-  → subject: ServiceAccount from controller namespace
-  → NOT owned by AutoscalingListener (cross-namespace)
-  → tracked via same labels
-
-Reconcile 4: Create Config Secret (if needed)
-Reconcile 5: Create Proxy Secret (if proxy configured)
-Reconcile 6: Create Listener Pod
-```
-
-### The Listener Role: Exact Permissions
-
-```go
-func rulesForListenerRole(resourceNames []string) []rbacv1.PolicyRule {
-    return []rbacv1.PolicyRule{
-        {
-            APIGroups:     []string{"actions.github.com"},
-            Resources:     []string{"ephemeralrunnersets"},
-            ResourceNames: resourceNames,  // ← scoped to ONE specific ERS by name
-            Verbs:         []string{"patch"},
-        },
-        {
-            APIGroups: []string{"actions.github.com"},
-            Resources: []string{"ephemeralrunners", "ephemeralrunners/status"},
-            Verbs:     []string{"patch"},
-        },
-    }
-}
-```
-
-Two rules:
-1. **Patch EphemeralRunnerSets** — limited to the specific ERS name (e.g., `my-runner-set-xyz123`)
-   - This is what the scaler uses to set `spec.replicas` and `spec.patchID`
-2. **Patch EphemeralRunners + status** — any runner in the namespace (not name-scoped)
-   - This is what `HandleJobStarted` uses to set job metadata on individual runners
-
-The listener CANNOT:
-- Create or delete EphemeralRunners (only the ERS controller does that)
-- Read/list EphemeralRunners (it doesn't need to — it gets info from GitHub messages)
-- Modify the AutoscalingRunnerSet or EphemeralRunnerSet beyond patching
-
-### Cross-Namespace RoleBinding
-
-The critical piece enabling cross-namespace access:
-
+**Cross-namespace binding:**
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: <listener-name>
-  namespace: arc-runners         # ← in the RUNNER namespace
+  namespace: arc-runners          # <-- Role lives here
 subjects:
 - kind: ServiceAccount
-  name: <listener-name>
-  namespace: arc-systems         # ← references SA in CONTROLLER namespace
+  name: <listener-sa>
+  namespace: arc-systems           # <-- SA lives here (different namespace!)
 roleRef:
   kind: Role
-  name: <listener-name>
-  apiGroup: rbac.authorization.k8s.io
+  name: <listener-role>
 ```
 
-This works because Kubernetes RoleBindings can reference subjects from any namespace. The role grants permissions within the RoleBinding's namespace (arc-runners), while the subject (ServiceAccount) lives in a different namespace (arc-systems).
+**Cross-namespace watch mechanism:**
 
-### Role Update Mechanism
+The controller needs to watch resources across namespaces. It uses label-based watches:
+```go
+// Labels stamped on cross-namespace resources
+"auto-scaling-listener-namespace": "<controller-ns>"
+"auto-scaling-listener-name":      "<listener-name>"
+```
 
-When the EphemeralRunnerSet name changes (e.g., during a rolling update), the role must be updated to reference the new name:
+The controller's informer filters on these labels, enabling it to watch Role/RoleBinding objects in runner namespaces without cluster-wide permissions.
+
+### Credential Isolation Design
+
+```
+┌─────────────────────────────────────┐
+│ Controller Namespace                 │
+│                                      │
+│  [GitHub App Secret]                 │  ← Only controller pod reads this
+│  [Listener Config Secrets]           │  ← One per scale set
+│  [Proxy/TLS Secrets]                 │  ← Optional
+│                                      │
+│  Controller pod: full GitHub API     │
+│  Listener pod: message queue only    │
+│                                      │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│ Runner Namespace                     │
+│                                      │
+│  [JIT Config Secrets]                │  ← One per runner, single-use
+│  [Runner Pods]                       │  ← Cannot see controller secrets
+│                                      │
+│  Runner pod: connects to GitHub      │
+│  with JIT token (one job only)       │
+│                                      │
+└─────────────────────────────────────┘
+```
+
+**Key isolation properties:**
+- Runner pods cannot access the GitHub App private key
+- Runner pods cannot see other runners' JIT tokens
+- Listener pods cannot create/delete pods (only patch ERS replica counts)
+- A compromised runner can only affect its single assigned job
+
+### Naming Conventions
+
+ARC uses deterministic naming with hash suffixes to avoid collisions:
+
+| Resource | Pattern | Example |
+|----------|---------|---------|
+| EphemeralRunnerSet | `<ars-name>-<hash8>` | `my-runners-a1b2c3d4` |
+| Listener Pod | `<ars-name>-<hash8>-listener` | `my-runners-a1b2c3d4-listener` |
+| ServiceAccount | `<ars-name>-<hash8>-listener` | `my-runners-a1b2c3d4-listener` |
+| Role | `<ars-name>-<hash8>-listener` | `my-runners-a1b2c3d4-listener` |
+| Config Secret | `<ars-name>-<hash8>-listener-config` | `my-runners-a1b2c3d4-listener-config` |
+| EphemeralRunner | `<ers-name>-<random5>` | `my-runners-a1b2c3d4-xk9f2` |
+| JIT Secret | `<er-name>-jitconfig` | `my-runners-a1b2c3d4-xk9f2-jitconfig` |
+
+The `<hash8>` is derived from the AutoscalingRunnerSet UID, ensuring uniqueness even if names collide across namespaces.
+
+---
+
+## 5. End-to-End Job Lifecycle
+
+This section traces a single workflow job from `git push` to completion. Four phases, four systems.
+
+### Phase 1: Job Queued (GitHub Side)
+
+```
+Developer pushes code
+       |
+       v
+GitHub evaluates workflow YAML
+       |
+       v
+Job created with runs-on labels (e.g., "self-hosted", "linux", "my-scale-set")
+       |
+       v
+Actions Service matches labels → finds your RunnerScaleSet
+       |
+       v
+Job enters queue for that scale set
+       |
+       v
+Actions Service sends message on long-poll connection
+```
+
+At this point, GitHub has:
+- Created a job with a unique `runnerRequestId`
+- Determined which scale set should handle it
+- Queued a `JobAvailable` message for the listener's next long-poll response
+
+### Phase 2: Scaling Decision (Listener + Scaler)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  LISTENER POD                                                        │
+│                                                                      │
+│  Message Loop (listener.Run)                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ 1. GetMessage(lastMessageID, maxCapacity)                    │    │
+│  │    → Long-poll to GitHub (blocks until message or timeout)   │    │
+│  │                                                              │    │
+│  │ 2. Response contains:                                        │    │
+│  │    - Statistics (assigned, running, idle counts)              │    │
+│  │    - JobAvailable messages (new jobs to claim)                │    │
+│  │    - JobStarted messages (runners picked up work)            │    │
+│  │    - JobCompleted messages (jobs finished)                    │    │
+│  │                                                              │    │
+│  │ 3. DeleteMessage(messageID) — ACK to GitHub                  │    │
+│  │                                                              │    │
+│  │ 4. AcquireJobs(requestIDs) — claim available jobs            │    │
+│  │    (prevents other scale sets from taking them)              │    │
+│  │                                                              │    │
+│  │ 5. HandleJobStarted / HandleJobCompleted                     │    │
+│  │    (update EphemeralRunner status annotations)               │    │
+│  │                                                              │    │
+│  │ 6. HandleDesiredRunnerCount(totalAssignedJobs)               │    │
+│  │    → Scaler calculates target and patches K8s               │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Scaler                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ target = min(minRunners + assignedJobs, maxRunners)          │    │
+│  │                                                              │    │
+│  │ if target != currentCount || !dirty:                         │    │
+│  │   PATCH EphemeralRunnerSet {                                 │    │
+│  │     spec.replicas = target                                   │    │
+│  │     spec.patchID = nextSequence()                            │    │
+│  │   }                                                          │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key details:**
+- `maxCapacity` is sent as an HTTP header (`X-ScaleSetMaxCapacity`) — tells GitHub how many jobs this set can currently accept
+- `AcquireJobs` is a claim/lock — once acquired, the job is committed to this scale set
+- The scaler patches the ERS in the runner namespace using the cross-namespace ServiceAccount
+
+### Phase 3: Runner Pod Creation (K8s Controllers)
+
+```
+EphemeralRunnerSet Controller                  EphemeralRunner Controller
+         |                                              |
+         |  Reconcile triggered by replica patch        |
+         |                                              |
+    ┌────┴────┐                                         |
+    │ Compare │                                         |
+    │ desired │  desired=5, current=3                   |
+    │ vs      │  → need 2 more                         |
+    │ actual  │                                         |
+    └────┬────┘                                         |
+         |                                              |
+    Create EphemeralRunner CRs (2x)                     |
+         |─────────────────────────────────────────────>|
+         |                                              |
+         |                              ┌───────────────┴──────────────┐
+         |                              │ For each new EphemeralRunner: │
+         |                              │                               │
+         |                              │ 1. Set phase = Pending        │
+         |                              │ 2. Call GenerateJitRunnerConfig│
+         |                              │    → GitHub returns JIT token │
+         |                              │ 3. Create K8s Secret          │
+         |                              │    (mount JIT config)         │
+         |                              │ 4. Create Pod                 │
+         |                              │    (uses runner template)     │
+         |                              │ 5. Set phase = Running        │
+         |                              │    (once pod is Running)      │
+         |                              └───────────────┬──────────────┘
+         |                                              |
+         |                                              v
+         |                              [Runner Pod starts]
+         |                              [Runner binary reads JIT config]
+         |                              [Runner connects to GitHub]
+         |                              [GitHub assigns queued job]
+```
+
+### Phase 4: Job Execution & Cleanup
+
+```
+Runner Pod                          GitHub                    EphemeralRunner Controller
+    |                                  |                              |
+    |── "I'm ready" ─────────────────>|                              |
+    |                                  |── Assigns job                |
+    |<── Job payload ─────────────────|                              |
+    |                                  |                              |
+    [Executes workflow steps]          |                              |
+    |                                  |                              |
+    |── Logs streaming ───────────────>|                              |
+    |                                  |                              |
+    [Job completes]                    |                              |
+    |── "Job done, result=success" ──>|                              |
+    |                                  |── Sends JobCompleted msg     |
+    [Runner process exits (code 0)]   |     to listener              |
+    [Pod terminates]                   |                              |
+    |                                  |                              |
+    |                                  |                    ┌─────────┴──────────┐
+    |                                  |                    │ Pod terminated:     │
+    |                                  |                    │ 1. Check exit code  │
+    |                                  |                    │    (0 = success)    │
+    |                                  |                    │ 2. Set phase =      │
+    |                                  |                    │    Succeeded        │
+    |                                  |                    │ 3. Remove runner    │
+    |                                  |                    │    from GitHub      │
+    |                                  |                    │ 4. Delete JIT secret│
+    |                                  |                    │ 5. Delete pod       │
+    |                                  |                    │ 6. ERS controller   │
+    |                                  |                    │    sees done runner,│
+    |                                  |                    │    adjusts count    │
+    |                                  |                    └────────────────────┘
+```
+
+### Complete Timeline (Wall-Clock)
+
+| Event | Typical Latency | Bottleneck |
+|-------|----------------|------------|
+| Push → Job queued | < 1s | GitHub processing |
+| Job queued → Listener notified | < 1s | Long-poll response |
+| Listener → ERS patched | < 100ms | K8s API call |
+| ERS patched → EphemeralRunner created | < 1s | Controller reconcile |
+| ER created → JIT config generated | 1-3s | GitHub API call |
+| JIT generated → Pod scheduled | 1-30s | K8s scheduler (node availability) |
+| Pod scheduled → Runner connected | 5-15s | Image pull + runner startup |
+| Runner connected → Job starts | < 1s | GitHub assignment |
+| **Total: push → job running** | **~10-50s** | **Dominated by pod scheduling + image pull** |
+
+---
+
+## 6. Scaling Engine Deep Dive
+
+### The Message Loop
+
+The listener's core is an infinite loop that long-polls GitHub for messages:
 
 ```go
-// In Reconcile():
-existingRuleHash := listenerRole.Labels["role-policy-rules-hash"]
-desiredRules := rulesForListenerRole([]string{autoscalingListener.Spec.EphemeralRunnerSetName})
-desiredRulesHash := hash.ComputeTemplateHash(&desiredRules)
+// Simplified from listener/listener.go
+func (l *Listener) Run(ctx context.Context, scaler Scaler) error {
+    // Bootstrap: use initial session statistics
+    initialStats := l.client.Session().Statistics
+    scaler.HandleDesiredRunnerCount(ctx, initialStats.TotalAssignedJobs)
 
-if existingRuleHash != desiredRulesHash {
-    // Update the role with new resource names
-    r.updateRoleForListener(ctx, listenerRole, desiredRules, desiredRulesHash, log)
-}
-```
+    var lastMessageID int
+    for {
+        msg, err := l.client.GetMessage(ctx, lastMessageID, l.maxRunners)
+        if msg == nil {
+            // Timeout/no message — re-assert current state
+            scaler.HandleDesiredRunnerCount(ctx, l.latestStatistics.TotalAssignedJobs)
+            continue
+        }
 
-The role stores a hash of its rules in `labels["role-policy-rules-hash"]` for fast drift detection.
-
-### The Config Secret
-
-The listener pod receives its configuration via a mounted secret:
-
-```
-Secret: <listener-name>-config
-Namespace: controller namespace
-Data:
-  config.json: {
-    "configureURL": "https://github.com/org/repo",
-    "ephemeralRunnerSetNamespace": "arc-runners",
-    "ephemeralRunnerSetName": "my-runner-set-abc123",
-    "maxRunners": 10,
-    "minRunners": 2,
-    "runnerScaleSetID": 42,
-    "runnerScaleSetName": "my-runners",
-    "logLevel": "debug",
-    "logFormat": "text",
-    "metricsAddr": ":8080",
-    "metricsEndpoint": "/metrics",
-    "appConfig": {        // ← GitHub App or PAT credentials
-      "token": "...",     // or appID + installationID + privateKey
-      ...
+        lastMessageID = msg.MessageID
+        l.handleMessage(ctx, scaler, msg)
     }
-  }
+}
 ```
 
-The config includes:
-- **Target ERS** (namespace + name) — so the scaler knows what to patch
-- **GitHub credentials** — from the `appConfig` field (read from user's GitHub secret)
-- **Scale set ID** — for the scaleset library to communicate with GitHub
-- **Logging and metrics** configuration
+**Message handling order matters:**
+1. Store statistics (latest truth from GitHub)
+2. Delete message (ACK — prevents redelivery)
+3. Acquire available jobs (claim them before scaling)
+4. Handle job started/completed (update runner CRs)
+5. Handle desired runner count (scale decision)
 
-### Pod Configuration
+### Statistics: GitHub's View of the World
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: <listener-name>
-  namespace: arc-systems          # controller namespace
-spec:
-  serviceAccountName: <listener-name>
-  restartPolicy: Never            # ← no restart; controller recreates on crash
-  terminationGracePeriodSeconds: 60
-  nodeSelector:
-    kubernetes.io/os: linux
-  containers:
-  - name: listener
-    image: ghcr.io/actions/gha-runner-scale-set-controller:0.13.1
-    command: ["/ghalistener"]
-    env:
-    - name: LISTENER_CONFIG_PATH
-      value: /etc/gha-listener/config.json
-    volumeMounts:
-    - name: listener-config
-      mountPath: /etc/gha-listener
-      readOnly: true
-  volumes:
-  - name: listener-config
-    secret:
-      secretName: <listener-name>-config
+Every message includes a `RunnerScaleSetStatistic` snapshot:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  RunnerScaleSetStatistic                             │
+│                                                      │
+│  TotalAvailableJobs:     3  ← In queue, unclaimed   │
+│  TotalAcquiredJobs:      2  ← Claimed, not assigned │
+│  TotalAssignedJobs:      5  ← Assigned to a runner  │
+│  TotalRunningJobs:       4  ← Actually executing    │
+│  TotalRegisteredRunners: 8  ← Known to GitHub       │
+│  TotalBusyRunners:       4  ← Running a job         │
+│  TotalIdleRunners:       4  ← Registered, waiting   │
+└─────────────────────────────────────────────────────┘
 ```
 
-Key details:
-- `restartPolicy: Never` — K8s won't restart the pod; the AutoscalingListener controller detects termination and recreates it
-- The same image as the controller (two binaries in one image)
-- Config mounted as a secret volume, not env vars (avoids command-line exposure)
-- `terminationGracePeriodSeconds: 60` — allows graceful session closure with GitHub
+The scaler uses `TotalAssignedJobs` as input — this represents the real demand that needs runners.
 
-### How the Listener Authenticates to K8s
+### The Scaling Formula
 
-The listener uses **in-cluster config** via the mounted ServiceAccount token:
+```
+targetRunners = min(minRunners + totalAssignedJobs, maxRunners)
+```
+
+**Examples:**
+
+| minRunners | maxRunners | assignedJobs | Target | Explanation |
+|-----------|-----------|-------------|--------|-------------|
+| 0 | 10 | 0 | 0 | No demand, scale to zero |
+| 0 | 10 | 3 | 3 | Scale to match demand |
+| 0 | 10 | 15 | 10 | Capped at max |
+| 5 | 10 | 0 | 5 | Warm pool maintained |
+| 5 | 10 | 3 | 8 | Warm pool + demand |
+| 5 | 10 | 7 | 10 | Capped at max |
+
+### The PatchID Mechanism
+
+The scaler doesn't just write `replicas = N` — it includes a **patchID** for deduplication:
+
+```
+Problem without patchID:
+  1. Listener patches ERS: replicas=5
+  2. ERS controller reconciles, creates 5 runners
+  3. Network glitch: listener doesn't see ACK
+  4. Listener retries: replicas=5
+  5. ERS controller sees same value... but is it a new request?
+  
+  Without deduplication: controller might create 5 MORE runners
+
+Solution with patchID:
+  1. Listener patches ERS: replicas=5, patchID=7
+  2. ERS controller reconciles, stores patchID=7
+  3. Listener retries: replicas=5, patchID=7
+  4. ERS controller: "patchID 7? Already processed. Skip."
+```
+
+**PatchID rules:**
+
+| Condition | PatchID Value | Meaning |
+|-----------|--------------|---------|
+| Normal scale (count changed) | Monotonically increasing (1, 2, 3...) | "New desired state" |
+| Identical count, state is dirty | Next sequence number | "Still need this many" |
+| Identical count, state is clean, at minRunners | 0 | "Force re-reconcile" (state sync) |
+
+**The "dirty" flag:** After a scale event, the state is "dirty" until the ERS controller has processed it (runners are actually created/deleted). While dirty, the scaler always sends a new patchID even if the count hasn't changed — this ensures the controller processes the request.
+
+**PatchID = 0 ("force state"):** When the system is idle (at minRunners, nothing happening), the scaler sends patchID=0. The ERS controller always processes patchID=0 patches, making it a heartbeat/sync mechanism.
+
+### ERS Controller: Processing Scale Requests
+
+The EphemeralRunnerSet controller receives the replica patch and reconciles:
+
+```
+Reconcile triggered (ERS spec changed)
+         |
+         v
+  ┌──────────────────────┐
+  │ Read spec.patchID    │
+  │ Read latest patchID  │
+  │ from annotations     │
+  └──────────┬───────────┘
+             |
+   ┌─────────┴─────────┐
+   │ spec.patchID != 0  │──── No ────> Process (force state)
+   │ AND                │
+   │ spec.patchID ==    │──── Yes ───> Skip (already processed)
+   │ latestPatchID      │
+   └─────────┬──────────┘
+             | (new patchID)
+             v
+  ┌──────────────────────┐
+  │ Classify runners:    │
+  │  - pending (no pod)  │
+  │  - running (has pod) │
+  │  - failed (retrying) │
+  │  - done (terminal)   │
+  └──────────┬───────────┘
+             |
+             v
+  scaleTotal = pending + running + failed
+             |
+   ┌─────────┴─────────────────┐
+   │ scaleTotal < spec.replicas │──── Scale UP
+   │ scaleTotal > spec.replicas │──── Scale DOWN
+   │ scaleTotal == spec.replicas│──── No change
+   └───────────────────────────┘
+```
+
+**Scale UP:** Create new EphemeralRunner CRs (each stamped with the current patchID annotation)
+
+**Scale DOWN:** 
+1. Select runners to remove (oldest first)
+2. Only remove runners that are registered (`RunnerID > 0`) AND have no assigned job
+3. Call GitHub API: `RemoveRunner(runnerID)` — deregisters from GitHub
+4. Delete the EphemeralRunner CR
+5. If no suitable candidates (all runners are busy), scale-down is deferred
+
+### MaxCapacity Header
+
+The `X-ScaleSetMaxCapacity` header sent with each long-poll tells GitHub how many MORE jobs this scale set can accept:
+
+```
+maxCapacity = maxRunners (from config)
+```
+
+GitHub uses this to avoid over-assigning jobs to a scale set that's nearly full. If maxCapacity is 0, GitHub won't send new `JobAvailable` messages to this set.
+
+### Metrics Interface
+
+The listener supports pluggable metrics via the `MetricsRecorder` interface:
 
 ```go
-// In scaler.New():
-conf, err := rest.InClusterConfig()  // reads /var/run/secrets/kubernetes.io/serviceaccount/token
-clientset, err := kubernetes.NewForConfig(conf)
+type MetricsRecorder interface {
+    RecordStatistics(statistics *scaleset.RunnerScaleSetStatistic)
+    RecordJobStarted(msg *scaleset.JobStarted)
+    RecordJobCompleted(msg *scaleset.JobCompleted)
+    RecordDesiredRunners(count int)
+}
 ```
 
-This automatically uses the ServiceAccount's token, which is projected into the pod by the kubelet. The token's permissions are defined by the Role + RoleBinding created above.
+These hooks fire at each scaling decision point, enabling custom Prometheus/OpenTelemetry exporters without modifying the listener core.
 
-### Config Secret Drift Detection
+---
 
-The controller detects and handles config drift:
+## 7. EphemeralRunner State Machine
+
+Each EphemeralRunner CR is a state machine managed by the EphemeralRunner controller. It tracks the full lifecycle of a single runner — from creation through job execution to cleanup.
+
+### Phases
+
+```
+                    ┌─────────┐
+                    │ Pending │ ← Initial state (JIT config + pod creation)
+                    └────┬────┘
+                         │ Pod enters Running state
+                         v
+                    ┌─────────┐
+                    │ Running │ ← Runner connected to GitHub, executing job
+                    └────┬────┘
+                         │ Pod terminates
+            ┌────────────┼────────────┐
+            │            │            │
+            v            v            v
+      ┌───────────┐ ┌────────┐ ┌──────────┐
+      │ Succeeded │ │ Failed │ │ Outdated │
+      └───────────┘ └────────┘ └──────────┘
+       (exit 0)     (retryable) (exit 7, rolling update)
+```
+
+| Phase | Meaning | Terminal? |
+|-------|---------|-----------|
+| **Pending** | JIT config being generated, pod being created | No |
+| **Running** | Pod is running, runner connected to GitHub | No |
+| **Succeeded** | Job completed successfully (exit code 0) | Yes |
+| **Failed** | Pod failed after max retries (5 failures) | Yes |
+| **Outdated** | Runner image/config was updated (exit code 7) | Yes |
+
+### The Reconcile Loop
 
 ```go
-func listenerConfigSecretDrifted(existing *corev1.Secret, desired *corev1.Secret) bool {
-    // Compare config.json data
-    if !bytes.Equal(existing.Data["config.json"], desired.Data["config.json"]) {
-        return true
+// Simplified decision tree for each reconcile
+func Reconcile(er *EphemeralRunner) {
+    if er.IsDone() {
+        cleanUpResources()  // delete pod, secret, deregister
+        return
     }
-    // Compare labels and annotations
-    if !maps.Equal(existing.Labels, desired.Labels) { return true }
-    if !maps.Equal(existing.Annotations, desired.Annotations) { return true }
-    return false
+
+    pod := getPod(er)
+
+    if pod == nil {
+        if shouldCreatePod(er) {
+            generateJitConfig()
+            createSecret()
+            createPod()
+        }
+        return
+    }
+
+    switch pod.Status.Phase {
+    case Running:
+        er.Status.Phase = Running
+        updateRunnerID()
+
+    case Succeeded:
+        er.Status.Phase = Succeeded
+
+    case Failed:
+        handlePodFailure(er, pod)
+    }
 }
 ```
 
-If the secret drifts (e.g., GitHub credentials rotated), the controller:
-1. Updates the secret in-place
-2. Deletes the listener pod (since volume contents may be cached)
-3. Pod gets recreated on next reconcile with fresh config
+### Pod Failure Handling & Exit Codes
 
-### Cleanup Order
+When a pod terminates, the controller inspects the exit code of the runner container:
 
-When the AutoscalingListener is deleted, resources are cleaned up in this order:
+| Exit Code | Meaning | Action |
+|-----------|---------|--------|
+| 0 | Job completed successfully | Phase → Succeeded |
+| 7 | Runner binary is outdated (rolling update signal) | Phase → Outdated |
+| Other (1, 137, etc.) | Crash, OOM, infrastructure failure | Retry (up to 5x) |
+
+**Exit code 7 special case:** GitHub's runner binary returns exit code 7 when it detects that a newer version exists. ARC interprets this as "this runner's image is stale" — it marks the EphemeralRunner as Outdated rather than Failed, which signals the rolling update system.
+
+### Retry Logic
+
+Failed pods are retried with exponential backoff:
 
 ```
-1. Delete listener Pod
-2. Delete config Secret
-3. Delete proxy Secret (if exists)
-4. Delete RoleBinding (in runner namespace)
-5. Delete Role (in runner namespace)
-6. Delete ServiceAccount (in controller namespace)
-7. Remove finalizer from AutoscalingListener → deleted
+Attempt 1: immediate (0s delay)
+Attempt 2: 5s delay
+Attempt 3: 10s delay
+Attempt 4: 20s delay
+Attempt 5: 40s delay
+Attempt 6: GIVE UP → Phase = Failed
 ```
 
-The Role and RoleBinding are NOT owned by the AutoscalingListener (cross-namespace ownership isn't possible in K8s), so they must be explicitly deleted. They're tracked via labels:
-- `auto-scaling-listener-namespace: arc-systems`
-- `auto-scaling-listener-name: <listener-name>`
+**Implementation:** The `Status.Failures` field is a `map[string]metav1.Time` keyed by pod UID. Each failed pod's UID is recorded with a timestamp. When `len(Failures) >= 5`, the runner is terminal.
 
-### Watch Mechanism for Cross-Namespace Resources
+```
+┌──────────────────────────────────────────────────────────┐
+│ Retry Decision Tree                                       │
+│                                                           │
+│  Pod terminated with non-zero, non-7 exit code            │
+│       |                                                   │
+│       v                                                   │
+│  len(failures) < 5?                                       │
+│       |                                                   │
+│    Yes |              No                                  │
+│       |               |                                   │
+│       v               v                                   │
+│  Record failure    Phase = Failed                         │
+│  Delete pod        (terminal, stop retrying)              │
+│  Requeue with                                             │
+│  backoff delay                                            │
+│       |                                                   │
+│       v                                                   │
+│  Next reconcile:                                          │
+│  pod == nil, shouldCreate?                                │
+│       |                                                   │
+│       v                                                   │
+│  Check backoff:                                           │
+│  time.Since(lastFailure) > backoffDuration[len(failures)]?│
+│       |                                                   │
+│    Yes → create new pod                                   │
+│    No  → requeue after remaining duration                 │
+└──────────────────────────────────────────────────────────┘
+```
 
-Since Role and RoleBinding can't use `Owns()` (wrong namespace), the controller uses `Watches()` with a label-based mapper:
+### JIT Config Generation & RunnerExistsError
 
+When creating a new runner, the controller calls GitHub to generate a JIT config. This can fail:
+
+```
+GenerateJitRunnerConfig(name, workFolder)
+       |
+       v
+  ┌──────────────┐
+  │ Success?     │
+  └──────┬───────┘
+    Yes  │         No
+         │          |
+         v          v
+  Create secret   ┌─────────────────────────────┐
+  + pod           │ Error type?                  │
+                  │                              │
+                  │ RunnerExistsError:           │
+                  │   Runner with same name      │
+                  │   already registered.        │
+                  │                              │
+                  │   Is it ours? (same scale set│
+                  │   ID + matches our runner?)  │
+                  │     Yes → get existing runner│
+                  │           use its config     │
+                  │     No  → fatal error        │
+                  │           (name collision)   │
+                  │                              │
+                  │ Other error:                 │
+                  │   Record as failure, retry   │
+                  └─────────────────────────────┘
+```
+
+### The deleteEphemeralRunnerOrPod Decision
+
+When cleaning up a failed runner, the controller decides whether to delete the entire EphemeralRunner or just the pod:
+
+```
+Runner has failed, needs cleanup
+       |
+       v
+  HasJob() ? (Status.JobID != "")
+       |
+    Yes |           No
+       |            |
+       v            v
+  Delete entire    Delete pod only
+  EphemeralRunner  (allows retry —
+  (job was         new pod will be
+  assigned, can't  created on next
+  retry — another  reconcile)
+  runner needed)
+```
+
+**Why this distinction matters:** If a job was already assigned to this runner, GitHub won't reassign it to the same EphemeralRunner. The only recovery is to delete the ER entirely, which lets the ERS controller create a fresh one that can get a new job assignment.
+
+### Finalizers
+
+Each EphemeralRunner has two finalizers that ensure clean shutdown:
+
+| Finalizer | Purpose | Cleanup Actions |
+|-----------|---------|-----------------|
+| `ephemeralrunner.actions.github.com/finalizer` | Resource cleanup | Delete pod, delete JIT secret, delete work pods (kubernetes mode) |
+| `ephemeralrunner.actions.github.com/runner-registration-finalizer` | GitHub deregistration | Call RemoveRunner API to deregister from GitHub |
+
+**Order matters:** Registration finalizer runs first (deregister from GitHub while pod may still be draining), then resource finalizer (delete K8s objects).
+
+**The "job still running" edge case:** If the controller tries to deregister a runner that's actively executing a job, GitHub returns `JobStillRunningError`. The controller backs off and retries — it won't force-delete a runner mid-job.
+
+---
+
+## 8. Rolling Updates
+
+When you change the runner configuration (image, template, env vars, etc.) via `helm upgrade`, ARC performs a rolling update. This section explains how changes are detected, how old runners drain, and how new ones take over.
+
+### Change Detection via Hashing
+
+The controller uses content hashing to detect changes:
+
+```
+AutoscalingRunnerSet spec
+       |
+       v
+  RunnerSetSpecHash()  ← hashes: githubConfigUrl, secret, runnerGroup,
+       |                   scaleSetName, proxy, TLS, template
+       v
+  Compare with annotation on latest EphemeralRunnerSet:
+    annotations["runner-spec-hash"]
+       |
+  ┌────┴────┐
+  │ Match?  │
+  └────┬────┘
+   Yes │        No
+       │         |
+       v         v
+  No change    Rolling update needed!
+  (normal      (create new ERS, drain old)
+   scaling)
+```
+
+**Three hash functions serve different purposes:**
+
+| Function | Hashes | Used to detect |
+|----------|--------|----------------|
+| `RunnerSetSpecHash()` | Runner-affecting fields (template, config, proxy) | Need new ERS (runner pods change) |
+| `ListenerSpecHash()` | Full ARS spec | Need to restart listener (any config change) |
+| `Hash()` | Entire ARS spec + labels | Need to update GitHub RunnerScaleSet |
+
+### Update Strategies
+
+The `--update-strategy` controller flag (or Helm value) determines how old runners drain:
+
+#### Immediate Strategy (default)
+
+```
+Time ──────────────────────────────────────────────────>
+
+  helm upgrade (image changed)
+       |
+       v
+  [ARS Controller detects hash mismatch]
+       |
+       ├── Create new ERS (v2) with replicas=0
+       ├── Mark old ERS (v1) as "outdated"
+       ├── Delete old listener pod
+       ├── Create new listener (points to v2 ERS)
+       |
+       v
+  [New listener starts]
+       ├── Receives jobs → scales v2 ERS
+       |
+  [Old v1 runners]
+       ├── Running jobs: allowed to finish
+       ├── Idle runners: immediately terminated
+       ├── New jobs: NOT assigned to v1
+       |
+  [Eventually: all v1 runners done]
+       └── Delete v1 ERS + cleanup
+```
+
+**Key property:** New pods start immediately on the new config. Old pods with active jobs are allowed to finish (not killed). Idle old pods are terminated right away.
+
+#### Eventual Strategy
+
+```
+Time ──────────────────────────────────────────────────>
+
+  helm upgrade (image changed)
+       |
+       v
+  [ARS Controller detects hash mismatch]
+       |
+       v
+  [Check: any running or pending runners on old ERS?]
+       |
+    Yes |
+       v
+  WAIT. Do not create new ERS yet.
+  Old runners continue receiving AND finishing jobs.
+       |
+  [Eventually: all old runners complete]
+       |
+       v
+  NOW create new ERS (v2)
+  Delete old ERS (v1)
+  Create new listener
+```
+
+**Key property:** No new ERS is created until the old one is fully drained. This means:
+- During drain, the system continues using old runners for new jobs
+- Zero "wasted" runner capacity (no overlap period)
+- Slower rollout (must wait for all jobs to complete)
+
+**Decision function:**
 ```go
-func (r *AutoscalingListenerReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&v1alpha1.AutoscalingListener{}).
-        Owns(&corev1.Pod{}).
-        Owns(&corev1.ServiceAccount{}).
-        Watches(&rbacv1.Role{}, handler.EnqueueRequestsFromMapFunc(labelBasedWatchFunc)).
-        Watches(&rbacv1.RoleBinding{}, handler.EnqueueRequestsFromMapFunc(labelBasedWatchFunc)).
-        Complete(r)
-}
-
-// labelBasedWatchFunc maps Role/RoleBinding events back to AutoscalingListener:
-func labelBasedWatchFunc(obj client.Object) []reconcile.Request {
-    labels := obj.GetLabels()
-    namespace := labels["auto-scaling-listener-namespace"]
-    name := labels["auto-scaling-listener-name"]
-    // → enqueue reconcile for that AutoscalingListener
+func drainingJobs(strategy, oldERS) bool {
+    if strategy != "eventual" {
+        return false  // immediate: never wait
+    }
+    running := oldERS.Status.RunningEphemeralRunners
+    pending := oldERS.Status.PendingEphemeralRunners
+    return (running + pending) > 0  // wait until fully drained
 }
 ```
 
-### GitHub Credentials Flow
+### The Rolling Update Sequence (Immediate)
 
-The listener needs GitHub credentials to create the scaleset client. These flow through:
-
-```
-User creates Secret (github-config-secret) in RUNNER namespace
-  → Contains: PAT token OR GitHub App (appID, installationID, privateKey)
-
-AutoscalingListener controller reads the secret via GetAppConfig()
-  → Resolves it into an appconfig.AppConfig struct
-
-Controller embeds credentials into listener config Secret
-  → Written to controller namespace as <listener-name>-config
-
-Listener pod reads /etc/gha-listener/config.json
-  → Uses credentials to create scaleset.Client
-  → Client handles token exchange (App → installation token) internally
-```
-
-The user's GitHub secret stays in the runner namespace. The controller copies the necessary credentials into the listener's config secret in the controller namespace. This way:
-- The listener pod doesn't need access to the runner namespace for secrets
-- Credentials are scoped to what the listener needs
-- Rotation is handled by the controller detecting config drift
-
-### Security Model Summary
-
-| Principle | Implementation |
-|-----------|---------------|
-| Least privilege | Listener can only PATCH specific resources, not create/delete/list |
-| Name-scoped | ERS patch is scoped to a single ERS by name |
-| Cross-namespace isolation | Runner pods can't reach controller namespace resources |
-| No shared ServiceAccount | Each listener gets its own SA, Role, RoleBinding |
-| Credential isolation | GitHub secrets read by controller, not directly by listener |
-| Automatic cleanup | Finalizer ensures RBAC is removed when listener is deleted |
-| Drift detection | Config hash comparison on every reconcile |
-
-### Naming Convention
-
-All resources for a listener share the same base name:
+Detailed step-by-step:
 
 ```
-Listener name:      <ars-name>-<hash8>-listener
-                    e.g., "my-runners-a1b2c3d4-listener"
+1. User runs: helm upgrade --set template.spec.containers[0].image=new-image
 
-ServiceAccount:     same as listener name (in controller ns)
-Role:               same as listener name (in runner ns)
-RoleBinding:        same as listener name (in runner ns)
-Config Secret:      <listener-name>-config (in controller ns)
-Proxy Secret:       <listener-name>-proxy (in controller ns)
-Pod:                same as listener name (in controller ns)
+2. Helm updates AutoscalingRunnerSet CR
+   (K8s API server stores new spec)
+
+3. ARS Controller reconciles:
+   a. Computes RunnerSetSpecHash() of new spec
+   b. Finds latest ERS, reads its "runner-spec-hash" annotation
+   c. Hashes don't match → rolling update
+
+4. ARS Controller creates new ERS (v2):
+   - replicas: 0
+   - annotations: {"runner-spec-hash": "<new-hash>"}
+   - spec: new pod template
+
+5. ARS Controller marks old ERS (v1):
+   - Sets phase to "Outdated" (if immediate strategy)
+
+6. ARS Controller deletes old listener pod:
+   - Listener was configured to patch v1 ERS
+   - New listener will patch v2 ERS
+
+7. ARS Controller creates new AutoscalingListener:
+   - Points to v2 ERS name in its config
+   - RBAC role updated to allow patching v2 ERS
+
+8. AutoscalingListener Controller reconciles:
+   - Creates ServiceAccount, Role, RoleBinding, Config Secret
+   - Creates new listener pod
+
+9. New listener starts:
+   - Creates session with GitHub (RunnerScaleSet still exists)
+   - Receives statistics → scales v2 ERS as needed
+   - New runner pods use new image
+
+10. Old ERS (v1) drains:
+    - ERS controller sees phase=Outdated
+    - Does NOT create new runners
+    - Existing runners finish their jobs → phase=Succeeded
+    - As runners complete, they're cleaned up normally
+
+11. ARS Controller sees v1 ERS is fully drained:
+    - All EphemeralRunners in terminal state
+    - Deletes v1 ERS
+    - Cleanup complete
 ```
 
-The `<hash8>` suffix is derived from: `FNV(namespace + "@" + runnerGroup + "@" + configURL)[:8]`
+### Multiple Pending Updates
+
+If you run `helm upgrade` twice before the first update completes:
+
+```
+ERS v1 (original) ── outdated, draining
+ERS v2 (first update) ── outdated, draining (was active briefly)
+ERS v3 (second update) ── ACTIVE (listener points here)
+```
+
+The ARS controller sorts EphemeralRunnerSets by creation timestamp (newest first). Only the newest is "active" — all others are treated as outdated and drained.
+
+### What Triggers vs. Doesn't Trigger a Rolling Update
+
+| Change | Triggers Rolling Update? | Why |
+|--------|------------------------|-----|
+| Runner image | Yes | Pod template changed |
+| Runner env vars | Yes | Pod template changed |
+| Volume mounts | Yes | Pod template changed |
+| minRunners/maxRunners | No | Scaling config only (listener handles it) |
+| GitHub config URL | Yes | Different repo/org target |
+| GitHub secret | Yes | Different credentials |
+| Runner group | Yes | Different runner group assignment |
+| Proxy/TLS config | Yes | Connectivity changes |
+| Controller image | No | Controller pod managed by its own Deployment |
+
+---
+
+## 9. Operations & Observability
+
+### Logging Architecture
+
+ARC components emit structured logs (JSON or text):
+
+| Component | Log Source | Key Log Fields |
+|-----------|-----------|----------------|
+| Controller Manager | `/manager` pod | `controller`, `reconcileID`, `namespace`, `name` |
+| Listener | `/ghalistener` pod | `scaleSetID`, `messageID`, `assignedJobs` |
+| Runner | Runner pod | Job logs (streamed to GitHub, not stored locally) |
+
+**Useful controller log lines to watch:**
+
+```
+# Scaling event
+"Scaling runner set" controller="EphemeralRunnerSet" replicas=5 patchID=12
+
+# Runner lifecycle
+"Creating ephemeral runner" controller="EphemeralRunner" runner="my-runners-a1b2-xk9f2"
+"Runner registered" runnerId=1234 jobId="abc-123"
+"Pod completed" exitCode=0 phase="Succeeded"
+
+# Retry
+"Pod failed, retrying" failures=2 backoff="10s"
+"Max failures reached" runner="my-runners-a1b2-xk9f2" failures=5
+
+# Rolling update
+"Runner spec hash mismatch, rolling update" old="abc123" new="def456"
+"Creating new EphemeralRunnerSet" name="my-runners-e5f6g7h8"
+"Draining old EphemeralRunnerSet" name="my-runners-a1b2c3d4"
+```
+
+### Common Failure Patterns & Troubleshooting
+
+#### Runner pods stuck in Pending
+
+```
+Symptom:  EphemeralRunners in Pending phase, no pods created
+Check:    kubectl get ephemeralrunners -n <runner-ns> -o wide
+Causes:
+  - GitHub API error generating JIT config (check controller logs)
+  - Rate limiting on GitHub API
+  - K8s RBAC: controller can't create pods in runner namespace
+  - Resource quota exhausted in runner namespace
+Fix:      Check controller logs for "failed to generate JIT config" errors
+```
+
+#### Listener pod CrashLooping
+
+```
+Symptom:  Listener pod in CrashLoopBackOff
+Check:    kubectl logs <listener-pod> -n <controller-ns>
+Causes:
+  - Invalid GitHub credentials (App key expired, PAT revoked)
+  - GitHub Actions Service unreachable (network/proxy issue)
+  - Config secret missing or malformed
+  - Session creation failure (scale set deleted from GitHub)
+Fix:      Check for "failed to create message session" in logs
+          Verify githubConfigSecret exists and is valid
+```
+
+#### Runners completing but not scaling down
+
+```
+Symptom:  Runner count stays high even when jobs complete
+Check:    kubectl get ers -n <runner-ns> -o yaml (check spec.replicas vs status)
+Causes:
+  - Listener not receiving JobCompleted messages
+  - PatchID stuck (listener can't reach K8s API)
+  - RBAC: listener can't patch ERS
+Fix:      Check listener logs for "failed to patch" errors
+          Verify Role/RoleBinding in runner namespace
+```
+
+#### Jobs assigned but runners never start
+
+```
+Symptom:  GitHub shows jobs "Waiting for a runner", pods exist but never connect
+Check:    kubectl logs <runner-pod> -n <runner-ns>
+Causes:
+  - Runner binary can't reach GitHub (proxy/firewall)
+  - JIT config expired (pod took too long to start)
+  - Runner image missing required binaries
+  - Init container failure (check init container logs)
+Fix:      Exec into pod, test connectivity: curl -I https://github.com
+          Check for ACTIONS_RUNNER_INPUT_JITCONFIG env var
+```
+
+#### Rolling update stuck (old ERS won't drain)
+
+```
+Symptom:  Old ERS has runners that never complete
+Check:    kubectl get er -n <runner-ns> -l runner-set=<old-ers>
+Causes:
+  - Runner executing a very long job
+  - Runner stuck (OOM, deadlock) but not timing out
+  - Eventual strategy: waiting for drain that won't complete
+Fix:      For stuck runners: delete the EphemeralRunner CR
+          (controller will deregister and clean up)
+          For hung jobs: cancel the workflow run in GitHub UI
+```
+
+### Key kubectl Commands
+
+```bash
+# See all ARC resources
+kubectl get autoscalingrunnerset,ephemeralrunnerset,ephemeralrunner -A
+
+# Check scaling state
+kubectl get ers -n <runner-ns> -o jsonpath='{.items[*].spec.replicas}'
+
+# Watch runner lifecycle
+kubectl get er -n <runner-ns> -w
+
+# Check listener health
+kubectl get pods -n <controller-ns> -l app.kubernetes.io/component=listener
+
+# See runner phases
+kubectl get er -n <runner-ns> -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,JOB:.status.jobId
+
+# Debug RBAC
+kubectl auth can-i patch ephemeralrunnersets --as=system:serviceaccount:<ctrl-ns>:<sa-name> -n <runner-ns>
+```
+
+---
+
+## 10. Source Code Reference
+
+### Controller Architecture
+
+The `/manager` binary runs four controllers in a single process:
+
+| Controller | Watches | Primary Responsibility |
+|-----------|---------|----------------------|
+| AutoscalingRunnerSet | `AutoscalingRunnerSet` | Orchestrates ERS + Listener lifecycle, rolling updates |
+| AutoscalingListener | `AutoscalingListener` | Creates/manages listener pod + RBAC + config |
+| EphemeralRunnerSet | `EphemeralRunnerSet` | Creates/deletes EphemeralRunners to match replica count |
+| EphemeralRunner | `EphemeralRunner` | Manages single runner lifecycle (JIT, pod, cleanup) |
 
 ### Key Source Files
 
-| Component | File | Key functions |
-|-----------|------|---------------|
-| Listener controller | `autoscalinglistener_controller.go` | `Reconcile()`, `createServiceAccountForListener()`, `createRoleForListener()`, `createRoleBindingForListener()` |
-| Role rules | `resourcebuilder.go:796` | `rulesForListenerRole()` |
-| ServiceAccount builder | `resourcebuilder.go:458` | `newScaleSetListenerServiceAccount()` |
-| Role builder | `resourcebuilder.go:478` | `newScaleSetListenerRole()` |
-| RoleBinding builder | `resourcebuilder.go:509` | `newScaleSetListenerRoleBinding()` |
-| Config secret | `resourcebuilder.go:179` | `newScaleSetListenerConfig()` |
-| Pod builder | `resourcebuilder.go:251` | `newScaleSetListenerPod()` |
-| Naming | `resourcebuilder.go:772` | `scaleSetListenerName()` |
-| Cleanup | `autoscalinglistener_controller.go:324` | `cleanupResources()` |
-| Cross-ns watch | `autoscalinglistener_controller.go:776` | `SetupWithManager()` with `labelBasedWatchFunc` |
+| File | Purpose |
+|------|---------|
+| `controllers/actions.github.com/autoscalingrunnerset_controller.go` | ARS reconcile: hash detection, rolling updates, ERS management |
+| `controllers/actions.github.com/autoscalinglistener_controller.go` | Listener reconcile: RBAC, config secret, pod creation |
+| `controllers/actions.github.com/ephemeralrunnerset_controller.go` | ERS reconcile: patchID processing, scale up/down |
+| `controllers/actions.github.com/ephemeralrunner_controller.go` | ER reconcile: JIT config, pod lifecycle, retries, finalizers |
+| `controllers/actions.github.com/resourcebuilder.go` | Constructs K8s objects (pods, roles, secrets, etc.) |
+| `cmd/ghalistener/main.go` | Listener binary entrypoint |
+| `cmd/ghalistener/scaler/scaler.go` | Scaler: formula, patchID logic, K8s patching |
+| `apis/actions.github.com/v1alpha1/` | CRD type definitions, hash functions |
+
+### Decision Trees
+
+**AutoscalingRunnerSet Controller — Main Decision:**
+```
+Reconcile(ARS)
+  |
+  ├── ARS being deleted?
+  |     └── Yes → cleanUpResources (delete all ERS, listener, RunnerScaleSet)
+  |
+  ├── No EphemeralRunnerSet exists?
+  |     └── Yes → Create first ERS + register RunnerScaleSet with GitHub
+  |
+  ├── RunnerSetSpecHash mismatch?
+  |     └── Yes → Rolling update (strategy-dependent)
+  |
+  ├── ListenerSpecHash mismatch?
+  |     └── Yes → Restart listener (delete + recreate)
+  |
+  └── Hash() mismatch?
+        └── Yes → Update RunnerScaleSet on GitHub (labels, settings)
+```
+
+**EphemeralRunner Controller — Pod Status Switch:**
+```
+Pod exists and terminated:
+  |
+  ├── All containers succeeded (exit 0)?
+  |     └── Phase = Succeeded
+  |
+  ├── Runner container exit code = 7?
+  |     └── Phase = Outdated
+  |
+  ├── Any init container failed?
+  |     └── Record failure, delete pod (retry)
+  |
+  ├── Runner container failed (other exit code)?
+  |     └── HasJob?
+  |           ├── Yes → delete EphemeralRunner (can't retry assigned job)
+  |           └── No  → delete pod only (retry with new pod)
+  |
+  └── Pod phase = Running?
+        └── Update ER phase to Running, record runnerID
+```
+
+### Reconcile Frequency & Triggers
+
+Controllers reconcile on:
+- **Watch events:** Create/Update/Delete of owned resources
+- **Requeue:** Explicit requeue-after (for backoff, periodic sync)
+- **Predicate filters:** Only relevant changes trigger reconcile (e.g., spec changes, not status-only updates)
+
+The EphemeralRunner controller requeues on backoff timers (`5s, 10s, 20s, 40s, 80s`) for retries. The ARS controller requeues periodically to check drain progress during rolling updates.
