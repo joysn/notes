@@ -1796,3 +1796,363 @@ Typical end-to-end latency from job queued to pod running: **10-30 seconds** dep
 | ERS controller | `controllers/actions.github.com/ephemeralrunnerset_controller.go` | `Reconcile()`, `deleteIdleEphemeralRunners()` |
 | Runner builder | `controllers/actions.github.com/resourcebuilder.go:622` | `newEphemeralRunner()` — stamps PatchID annotation |
 | Types | `github.com/actions/scaleset@v0.3.0/types.go` | `RunnerScaleSetStatistic`, `RunnerScaleSetMessage` |
+
+---
+
+## Deep Dive: EphemeralRunner State Machine (Pod Creation, Retries, Failure Handling)
+
+The EphemeralRunner controller (`ephemeralrunner_controller.go`) manages the full lifecycle of a single runner — from JIT config registration through pod creation, monitoring, retries, and cleanup.
+
+### State Machine Diagram
+
+```
+                              ┌─────────────────────────────────┐
+                              │  EphemeralRunner CR Created      │
+                              │  (by EphemeralRunnerSet ctrl)    │
+                              └───────────────┬─────────────────┘
+                                              │
+                                              ▼
+                              ┌─────────────────────────────────┐
+                              │  Add Finalizers                  │
+                              │  - ephemeralrunner.../finalizer  │
+                              │  - ephemeralrunner.../runner-    │
+                              │    registration-finalizer        │
+                              └───────────────┬─────────────────┘
+                                              │
+                                              ▼
+                              ┌─────────────────────────────────┐
+                              │  JIT Config Phase                │
+                              │  Secret exists?                  │
+                              └───────┬───────────────┬─────────┘
+                                      │ no            │ yes
+                                      ▼               │
+                              ┌───────────────────┐   │
+                              │ GenerateJitRunner  │   │
+                              │ Config (GitHub API)│   │
+                              └──┬────┬────┬──────┘   │
+                    ok ──────────┘    │    │           │
+                    retryable ────────┘    │           │
+                    fatal ────────────────►│           │
+                                          │           │
+                    ┌─────────────────────┘           │
+                    ▼                                  │
+          ┌──────────────────┐                        │
+          │ Delete self      │                        │
+          │ (unrecoverable)  │                        │
+          └──────────────────┘                        │
+                                                      │
+                              ┌────────────────────────┘
+                              │
+                              ▼
+                ┌───────────────────────────────────┐
+                │  Create Secret (JIT config data)   │
+                │  → contains runnerId, runnerName   │
+                └───────────────┬───────────────────┘
+                                │
+                                ▼
+                ┌───────────────────────────────────┐
+                │  Update Status: RunnerID           │
+                │  (runner is now registered with    │
+                │   GitHub Actions service)          │
+                └───────────────┬───────────────────┘
+                                │
+                                ▼
+                ┌───────────────────────────────────┐
+                │  Check failure count               │
+                │  len(Failures) > 5?                │
+                ├───────────┬───────────────────────┘
+                │ yes       │ no
+                ▼           ▼
+        ┌──────────┐  ┌───────────────────────────────┐
+        │ Delete   │  │  Backoff check                 │
+        │ self     │  │  (if lastFailure + backoff     │
+        │ (give up)│  │   > now → requeue with delay)  │
+        └──────────┘  └───────────────┬────────────────┘
+                                      │
+                                      ▼
+                      ┌───────────────────────────────┐
+                      │  Pod exists?                    │
+                      └──────┬───────────────┬────────┘
+                             │ no            │ yes
+                             ▼               ▼
+                      ┌──────────────┐  ┌──────────────────────┐
+                      │ Create Pod   │  │ Inspect Pod Status   │
+                      └──────────────┘  └──────────────────────┘
+                                              │
+                     ┌────────────────────────┼──────────────────┐
+                     │                        │                  │
+                     ▼                        ▼                  ▼
+            ┌────────────────┐  ┌─────────────────────┐  ┌──────────────┐
+            │ Pod Running    │  │ Pod Failed           │  │ Pod Succeeded│
+            │ → update phase │  │ → retry or fail     │  │ → delete self│
+            └────────────────┘  └─────────────────────┘  └──────────────┘
+```
+
+### Phases
+
+| Phase | Meaning | Terminal? |
+|-------|---------|-----------|
+| `""` (empty) | Just created, not yet processed | No |
+| `Pending` | JIT config obtained, pod being created/scheduled | No |
+| `Running` | Pod is running, runner registered with GitHub | No |
+| `Succeeded` | Runner completed job successfully (exit code 0) | Yes |
+| `Failed` | Unrecoverable failure after retries exhausted | Yes |
+| `Outdated` | Runner exited with code 7 (version mismatch) | Yes |
+
+`IsDone()` returns true for Succeeded, Failed, or Outdated.
+
+### Two Finalizers
+
+Each EphemeralRunner has two finalizers, serving different cleanup purposes:
+
+| Finalizer | Purpose | Removal condition |
+|-----------|---------|-------------------|
+| `ephemeralrunner.actions.github.com/finalizer` | Cleanup pod + secret | Pod and secret deleted |
+| `ephemeralrunner.actions.github.com/runner-registration-finalizer` | Deregister from GitHub | `RemoveRunner()` succeeds or runner has no job |
+
+Deletion sequence when `DeletionTimestamp` is set:
+1. Try to remove runner from GitHub (registration finalizer)
+   - If `JobStillRunningError` → requeue after 30s
+   - If success → remove registration finalizer
+2. Delete pod and JIT secret (resource finalizer)
+3. If container hooks configured → clean up linked pods and secrets
+4. Remove resource finalizer → CR deleted
+
+### JIT Config Flow (Runner Registration)
+
+When the EphemeralRunner CR is first created, it has no secret:
+
+```
+1. Call actionsClient.GenerateJitRunnerConfig(name, scaleSetID)
+   → POST to GitHub Actions service
+   → Returns: runner ID, encoded JIT config, runner name
+
+2. If SUCCESS:
+   → Create K8s Secret with data:
+     - "runnerId": <id>
+     - "runnerName": <name>  
+     - ".runner_jit_config": <encoded config>
+   → Update EphemeralRunner.Status.RunnerID and RunnerName
+
+3. If RunnerExistsError (name collision):
+   → Get runner by name from GitHub
+   → If it belongs to THIS scale set:
+     - Remove it from GitHub
+     - Return retryableError (requeue immediately)
+   → If it belongs to ANOTHER scale set:
+     - Return fatalError (delete this EphemeralRunner)
+   → If it no longer exists:
+     - Return retryableError (requeue immediately)
+```
+
+### Pod Creation
+
+Once the secret exists and RunnerID is set:
+
+```go
+func createPod(runner, secret):
+  1. Build pod spec from runner.Spec.PodTemplateSpec
+  2. Inject proxy env vars (if configured)
+  3. Set controller reference (EphemeralRunner owns the pod)
+  4. Create pod via K8s API
+```
+
+Pod creation error handling:
+
+| Error type | Action |
+|-----------|--------|
+| `nil` (success) | Return, wait for pod events |
+| `AlreadyExists` | Requeue after 5s (pod event may arrive) |
+| `Invalid` | Mark EphemeralRunner as **Failed** (unrecoverable) |
+| `Forbidden` + quota exceeded + age < 10min | Requeue after 30s (quota may free up) |
+| `Forbidden` + quota exceeded + age > 10min | Delete self (recreate with fresh JIT token) |
+| `Forbidden` (other) | Mark as **Failed** |
+| Default error | Return error (controller-runtime will requeue) |
+
+### Retry Mechanism (Exponential Backoff)
+
+Failed pods don't immediately cause the EphemeralRunner to fail. Instead:
+
+```
+Backoff schedule:
+  Attempt 0: 0s      (initial)
+  Attempt 1: 5s
+  Attempt 2: 10s
+  Attempt 3: 20s
+  Attempt 4: 40s
+  Attempt 5: 80s
+  Attempt 6: → DELETE (give up after 5 failures)
+```
+
+How it works:
+1. Pod fails → `deletePodAsFailed()` is called
+2. Pod is deleted
+3. `Status.Failures[podUID] = now` is patched (map keyed by pod UID)
+4. Next reconcile checks `len(Failures) > maxFailures (5)`:
+   - If yes → delete the EphemeralRunner (it will be recreated by EphemeralRunnerSet)
+   - If no → compute `lastFailure + backoff[len(Failures)]`
+   - If still in backoff period → requeue with delay
+   - If past backoff → proceed to create new pod
+
+The Failures map uses pod UIDs as keys, ensuring each distinct pod failure is counted exactly once.
+
+### Pod Status Inspection (The Main Switch)
+
+When the pod exists, the controller inspects `pod.Status.Phase` and `runnerContainerStatus`:
+
+```
+Pod inspection logic:
+
+1. pod.Status.Phase == PodFailed (all containers stopped):
+   └─ runner container terminated?
+      ├─ No state → delete pod (restart)
+      ├─ ExitCode 0 → SUCCESS (delete EphemeralRunner, sidecar failure ignored)
+      ├─ ExitCode 7 → OUTDATED (mark as outdated)
+      └─ Other → delete pod or EphemeralRunner
+
+2. initContainerFailed(pod):
+   └─ Any init container exited non-zero → delete pod (restart)
+
+3. runner container status == nil:
+   └─ Pod still starting → wait (no action)
+
+4. runner container NOT terminated:
+   └─ Still running → update EphemeralRunner phase to "Running"
+
+5. runner container terminated:
+   ├─ ExitCode 0 → SUCCESS (delete EphemeralRunner)
+   ├─ ExitCode 7 → OUTDATED
+   └─ Other → delete pod or EphemeralRunner
+```
+
+### Exit Code Semantics
+
+| Exit Code | Meaning | Controller Action |
+|-----------|---------|-------------------|
+| 0 | Job completed successfully | Delete EphemeralRunner → Succeeded |
+| 7 | Runner version outdated (needs upgrade) | Mark as Outdated, deregister |
+| Other non-zero | Failure (crash, OOM, misconfiguration) | Retry (delete pod, backoff) |
+
+Exit code 7 is special: the GitHub runner binary uses it to signal that the server has a newer version available. The controller marks the runner as `Outdated` rather than failed — the AutoscalingRunnerSet controller will eventually replace it.
+
+### deleteEphemeralRunnerOrPod Decision
+
+When a pod fails, the controller must decide: retry the pod, or give up on the EphemeralRunner entirely?
+
+```
+deleteEphemeralRunnerOrPod(ephemeralRunner, pod):
+  If runner HasJob() (status.jobID is set):
+    → Runner was assigned work but crashed
+    → This is a serious failure (faulty entrypoint or external kill)
+    → DELETE the EphemeralRunner entirely
+    → Also try to RemoveRunner from GitHub (best effort)
+  
+  If runner does NOT have a job:
+    → Runner crashed before getting work
+    → This might be transient (node issue, image pull fail)
+    → Delete just the Pod (triggers retry with backoff)
+    → Track failure in Status.Failures
+```
+
+### Resource Quota Handling
+
+A special case for `Forbidden` errors during pod creation:
+
+```
+If error contains "exceeded quota:":
+  If runner was created < 10 minutes ago:
+    → Requeue after 30s (quota might free up)
+  If runner was created > 10 minutes ago:
+    → Delete the EphemeralRunner (JIT token may expire; recreate fresh)
+```
+
+The 10-minute threshold exists because JIT tokens have a limited lifetime. If we wait too long, the token expires and the runner can never register, so it's better to delete and let the EphemeralRunnerSet create a fresh one.
+
+### Container Hooks Cleanup
+
+If the runner has `ACTIONS_RUNNER_CONTAINER_HOOKS` env var set, it may have created additional pods and secrets (for running workflow steps in separate containers). On cleanup:
+
+1. List all pods with label `runner-pod: <ephemeralRunner.Name>`
+2. Delete each one
+3. List all secrets with label `runner-pod: <ephemeralRunner.Name>`
+4. Delete each one
+
+### Complete Lifecycle Timeline
+
+```
+Time ──────────────────────────────────────────────────────────────────────▶
+
+ERS Controller    │ Creates EphemeralRunner CR │
+                  │  (with PatchID annotation) │
+                  │                            │
+ER Controller     │                            │ Reconcile triggered
+                  │                            │ Add finalizers
+                  │                            │ → GenerateJitRunnerConfig (GitHub API call)
+                  │                            │ → Create Secret (runnerId, JIT config)
+                  │                            │ → Patch Status (RunnerID, RunnerName)
+                  │                            │ → Create Pod
+                  │                            │
+Pod Lifecycle     │                            │   Pod Pending → Scheduled → Running
+                  │                            │   Runner binary starts
+                  │                            │   Connects to GitHub, registers
+                  │                            │   Picks up assigned job
+                  │                            │
+Listener          │                            │   JobStarted message received
+                  │                            │   → Patches ER.Status with job info
+                  │                            │
+Pod Lifecycle     │                            │   Job executes...
+                  │                            │   Job completes → runner exits (code 0)
+                  │                            │   Pod phase → Succeeded
+                  │                            │
+ER Controller     │                            │   Reconcile: exit code 0
+                  │                            │   → Delete EphemeralRunner
+                  │                            │   → Finalization:
+                  │                            │     - RemoveRunner from GitHub
+                  │                            │     - Delete Pod
+                  │                            │     - Delete Secret
+                  │                            │     - Remove finalizers
+                  │                            │
+ERS Controller    │                            │   Reconcile: runner gone
+                  │                            │   → Update status counts
+```
+
+### Failure Scenario: Pod Crashes Twice Then Succeeds
+
+```
+Attempt 1:
+  → Create Pod → Pod crashes (non-zero exit, no job assigned)
+  → deletePodAsFailed(): delete pod, record failure[pod-uid-1]
+  → Backoff: requeue after 5s
+
+Attempt 2 (after 5s):
+  → Create Pod → Pod crashes again (e.g., image pull backoff)  
+  → deletePodAsFailed(): delete pod, record failure[pod-uid-2]
+  → Backoff: requeue after 10s
+
+Attempt 3 (after 10s):
+  → Create Pod → Pod starts successfully
+  → Runner registers, picks up job, completes
+  → ExitCode 0 → Delete EphemeralRunner → done
+```
+
+### Failure Scenario: Permanent Failure (Exceeds Max Retries)
+
+```
+Attempts 1-5: Pod keeps crashing
+  → Each time: delete pod, record failure, backoff
+
+Attempt 6:
+  → len(Failures) = 6 > maxFailures(5)
+  → Delete EphemeralRunner entirely
+  → EphemeralRunnerSet controller will eventually create a replacement
+    (on next listener patch with a new patchID)
+```
+
+### Key Source Files
+
+| Component | File | Key functions |
+|-----------|------|---------------|
+| Controller | `controllers/actions.github.com/ephemeralrunner_controller.go` | `Reconcile()`, `createRunnerJitConfig()`, `createPod()`, `deleteEphemeralRunnerOrPod()`, `deletePodAsFailed()` |
+| Types/Phases | `apis/actions.github.com/v1alpha1/ephemeralrunner_types.go` | `IsDone()`, `HasJob()`, phase constants |
+| Error types | `controllers/actions.github.com/error.go` | `retryableError`, `fatalError` |
+| Backoff config | `ephemeralrunner_controller.go:56-63` | `failedRunnerBackoff` array, `maxFailures = 5` |
